@@ -6,6 +6,7 @@ from __future__ import print_function
 
 import os
 import sys
+sys.path.append('/data/private/chenyutong/VLP/')
 import logging
 import glob
 import math
@@ -413,7 +414,7 @@ def main():
                              t_total=t_total)
 
     if args.amp:
-        model, optimizer = amp.initialize(model, optimizer, opt_level='02')
+        model, optimizer = amp.initialize(model, optimizer, opt_level='O2')#'02')
 
     if args.local_rank != -1:
         try:
@@ -572,7 +573,6 @@ def main():
                 if args.amp:
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
                         scaled_loss.backward()
-                    optimizer.backward(loss)
                     # if amp_handle:
                     #     amp_handle._clear_cache()
                 else:

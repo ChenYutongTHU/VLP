@@ -19,6 +19,7 @@ import os
 import imghdr
 import numpy as np
 import h5py
+import tqdm
 
 
 def truncate_tokens_pair(tokens_a, tokens_b, max_len, max_len_a=0, max_len_b=0, trunc_seg=None, always_truncate_tail=False):
@@ -120,7 +121,7 @@ class Img2txtDataset(torch.utils.data.Dataset):
                 else:
                     valid_jpgs = set(json.load(open(file_valid_jpgs)))
                     print('Loading {0} valid JPG IDs!'.format(len(valid_jpgs)))
-                    for src in img_dat:
+                    for src in tqdm.tqdm(img_dat):
                         if src['split'] in split:
                             if use_num_imgs == -1 or counter < use_num_imgs:
                                 if enable_butd:
@@ -135,8 +136,8 @@ class Img2txtDataset(torch.utils.data.Dataset):
                                         tgt_tk = tokenizer.tokenize(sent['raw'])
                                         assert len(tgt_tk) > 0
                                         self.ex_list.append((src_tk, tgt_tk, {'answers': ['dummy']}))
-                                        if counter%10000 == 0:
-                                            print(src_tk, tgt_tk)
+                                        # if counter%10000 == 0:
+                                        #     print(src_tk, tgt_tk)
                                     counter += 1
         elif tasks == 'vqa2':
             counter = 0
@@ -322,9 +323,9 @@ class Preprocess4Seq2seq(Pipeline):
             img_id = img_path.split('/')[-1].split('.')[0]
             if self.region_det_file_prefix != '':
                 # read data from h5 files
-                with h5py.File(self.region_det_file_prefix+'_feat'+img_id[-3:] +'.h5', 'r') as region_feat_f, \
-                        h5py.File(self.region_det_file_prefix+'_cls'+img_id[-3:] +'.h5', 'r') as region_cls_f, \
-                        h5py.File(self.region_bbox_file, 'r') as region_bbox_f:
+                with h5py.File(self.region_det_file_prefix+'_feat'+img_id[-1:] +'.h5', 'r') as region_feat_f, \
+                        h5py.File(self.region_det_file_prefix+'_cls'+img_id[-1:] +'.h5', 'r') as region_cls_f, \
+                        h5py.File(self.region_bbox_file+img_id[-1:]+'.h5', 'r') as region_bbox_f:
                     img = torch.from_numpy(region_feat_f[img_id][:]).float()
                     cls_label = torch.from_numpy(region_cls_f[img_id][:]).float()
                     vis_pe = torch.from_numpy(region_bbox_f[img_id][:])
@@ -443,8 +444,8 @@ class Preprocess4Seq2seqDecoder(Pipeline):
             img_id = img_path.split('/')[-1].split('.')[0]
             if self.region_det_file_prefix != '':
                 # read data from h5 files
-                with h5py.File(self.region_det_file_prefix+'_feat'+img_id[-3:] +'.h5', 'r') as region_feat_f, \
-                        h5py.File(self.region_det_file_prefix+'_cls'+img_id[-3:] +'.h5', 'r') as region_cls_f, \
+                with h5py.File(self.region_det_file_prefix+'_feat'+img_id[-1:] +'.h5', 'r') as region_feat_f, \
+                        h5py.File(self.region_det_file_prefix+'_cls'+img_id[-1:] +'.h5', 'r') as region_cls_f, \
                         h5py.File(self.region_bbox_file, 'r') as region_bbox_f:
                     img = torch.from_numpy(region_feat_f[img_id][:]).float()
                     cls_label = torch.from_numpy(region_cls_f[img_id][:]).float()

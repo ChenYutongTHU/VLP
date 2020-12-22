@@ -15,6 +15,8 @@ import numpy as np
 import torch
 import random
 import pickle
+import sys
+sys.path.append('/data/private/chenyutong/VLP/')
 
 from pytorch_pretrained_bert.tokenization import BertTokenizer, WhitespaceTokenizer
 from pytorch_pretrained_bert.modeling import BertForSeq2SeqDecoder
@@ -62,8 +64,8 @@ def main():
                         help="max position embeddings")
 
     # For decoding
-    parser.add_argument('--fp16', action='store_true',
-                        help="Whether to use 16-bit float precision instead of 32-bit")
+    #parser.add_argument('--fp16', action='store_true',
+     #                   help="Whether to use 16-bit float precision instead of 32-bit")
     parser.add_argument('--amp', action='store_true',
                         help="Whether to use amp for fp16")
     parser.add_argument('--seed', type=int, default=123,
@@ -113,7 +115,6 @@ def main():
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu")
     n_gpu = torch.cuda.device_count()
-
     # fix random seed
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -126,19 +127,19 @@ def main():
 
     args.max_seq_length = args.max_tgt_length + args.len_vis_input + 3 # +3 for 2x[SEP] and [CLS]
     tokenizer.max_len = args.max_seq_length
-
+    #print('130')
     bi_uni_pipeline = []
     bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seqDecoder(list(
         tokenizer.vocab.keys()), tokenizer.convert_tokens_to_ids, args.max_seq_length,
         max_tgt_length=args.max_tgt_length, new_segment_ids=args.new_segment_ids,
         mode='s2s', len_vis_input=args.len_vis_input, enable_butd=args.enable_butd,
         region_bbox_file=args.region_bbox_file, region_det_file_prefix=args.region_det_file_prefix))
-
+    #print('137')
     amp_handle = None
-    if args.fp16 and args.amp:
+    if args.amp:
         from apex import amp
-        amp_handle = amp.init(enable_caching=True)
-        logger.info("enable fp16 with amp")
+    #    amp_handle = amp.init(enable_caching=True)
+    #    logger.info("enable fp16 with amp")
 
     # Prepare model
     cls_num_labels = 2
@@ -171,13 +172,15 @@ def main():
         # from vlp.resnet import resnet		
         # cnn = resnet(args.resnet_model, _num_layers=101, _fixed_block=4, pretrained=True) # no finetuning
 
-        if args.fp16:
-            model.half()
+        if args.amp:#args.fp16:
+            if args.fp32_embedding:
+                raise NotImplementedError
+            #model.half()
             # cnn.half()
         model.to(device)
         # cnn.to(device)
-        if n_gpu > 1:
-            model = torch.nn.DataParallel(model)
+        # if n_gpu > 1:
+        #     model = torch.nn.DataParallel(model)
             # cnn = torch.nn.DataParallel(cnn)
 
         torch.cuda.empty_cache()
@@ -197,7 +200,7 @@ def main():
                     else:
                         src_tk = os.path.join(args.image_root, src.get('filepath', 'trainval'), src['filename'])
                     if args.dataset == 'coco':
-                        imgid = int(src['filename'].split('_')[2][:-4])
+                        imgid = int(src['filename'].split('_')[2][:-4]) # 000000******
                     elif args.dataset == 'cc':
                         imgid = int(src['imgid'])
                     elif args.dataset == 'flickr30k':
@@ -227,9 +230,9 @@ def main():
                     batch = [t.to(device) for t in batch]
                     input_ids, token_type_ids, position_ids, input_mask, task_idx, img, vis_pe = batch
 
-                    if args.fp16:
-                        img = img.half()
-                        vis_pe = vis_pe.half()
+                    # if args.fp16:
+                    #     img = img.half()
+                    #     vis_pe = vis_pe.half()
 
                     if args.enable_butd:
                         conv_feats = img.data # Bx100x2048
@@ -261,6 +264,8 @@ def main():
 
         predictions = [{'image_id': tup[1], 'caption': output_lines[img_idx]} for img_idx, tup in enumerate(input_lines)]
 
+        with open('predictions.json','w') as f:
+            json.dump(predictions, f)
         lang_stats = language_eval(args.dataset, predictions, args.model_recover_path.split('/')[-2]+'-'+args.split+'-'+args.model_recover_path.split('/')[-1].split('.')[-2], args.split)
 
 

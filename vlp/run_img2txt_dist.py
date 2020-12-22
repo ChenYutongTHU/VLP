@@ -112,14 +112,14 @@ def main():
                         type=int,
                         default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
-    parser.add_argument('--fp16', action='store_true',
-                        help="Whether to use 16-bit float precision instead of 32-bit")
+    # parser.add_argument('--fp16', action='store_true',
+    #                     help="Whether to use 16-bit float precision instead of 32-bit")
     parser.add_argument('--fp32_embedding', action='store_true',
                         help="Whether to use 32-bit float precision instead of 32-bit for embeddings")
-    parser.add_argument('--loss_scale', type=float, default=0,
-                        help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
-                             "0 (default value): dynamic loss scaling.\n"
-                             "Positive power of 2: static loss scaling value.\n")
+    # parser.add_argument('--loss_scale', type=float, default=0,
+    #                     help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
+    #                          "0 (default value): dynamic loss scaling.\n"
+    #                          "Positive power of 2: static loss scaling value.\n")
     parser.add_argument('--amp', action='store_true',
                         help="Whether to use amp for fp16")
     parser.add_argument('--from_scratch', action='store_true',
@@ -232,8 +232,8 @@ def main():
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.distributed.init_process_group(backend='nccl', init_method = args.dist_url,
             world_size=args.world_size, rank=args.global_rank)
-    logger.info("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
-        device, n_gpu, bool(args.local_rank != -1), args.fp16))
+    logger.info("device: {} n_gpu: {}, distributed training: {}, amp training: {}".format(
+        device, n_gpu, bool(args.local_rank != -1), args.amp))
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
@@ -302,10 +302,10 @@ def main():
                   args.gradient_accumulation_steps)
 
     amp_handle = None
-    if args.fp16 and args.amp:
+    if  args.amp:
         from apex import amp
-        amp_handle = amp.init(enable_caching=True)
-        logger.info("enable fp16 with amp")
+        # amp_handle = amp.init(enable_caching=True)
+        # logger.info("enable fp16 with amp")
 
     # Prepare model
     recover_step = _get_max_epoch_model(args.output_dir)
@@ -367,28 +367,16 @@ def main():
     # from vlp.resnet import resnet
     # cnn = resnet(args.resnet_model, _num_layers=101, _fixed_block=4, pretrained=True) # no finetuning
 
-    if args.fp16:
-        model.half()
+    if args.amp:
+        #model.half()
         # cnn.half()
         if args.fp32_embedding:
+            raise NotImplementedError
             model.bert.embeddings.word_embeddings.float()
             model.bert.embeddings.position_embeddings.float()
             model.bert.embeddings.token_type_embeddings.float()
     model.to(device)
-    # cnn.to(device)
-    if args.local_rank != -1:
-        try:
-            # from apex.parallel import DistributedDataParallel as DDP
-            from torch.nn.parallel import DistributedDataParallel as DDP
-        except ImportError:
-            raise ImportError(
-                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
-        model = DDP(model, device_ids = [args.local_rank], output_device = args.local_rank, find_unused_parameters=True)
-        # cnn = DDP(cnn)
-    elif n_gpu > 1:
-        # model = torch.nn.DataParallel(model)
-        model = DataParallelImbalance(model)
-        # cnn = DataParallelImbalance(cnn)
+
 
     # Prepare optimizer
     param_optimizer = list(model.named_parameters())
@@ -399,10 +387,10 @@ def main():
         {'params': [p for n, p in param_optimizer if any(
             nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
-    if args.fp16:
+    if args.amp:
         try:
             # from apex.optimizers import FP16_Optimizer
-            from pytorch_pretrained_bert.optimization_fp16 import FP16_Optimizer_State
+            #from pytorch_pretrained_bert.optimization_fp16 import FP16_Optimizer_State
             from apex.optimizers import FusedAdam
         except ImportError:
             raise ImportError(
@@ -410,20 +398,34 @@ def main():
 
         optimizer = FusedAdam(optimizer_grouped_parameters,
                               lr=args.learning_rate,
-                              bias_correction=False,
-                              max_grad_norm=1.0)
-        if args.loss_scale == 0:
-            optimizer = FP16_Optimizer_State(
-                optimizer, dynamic_loss_scale=True)
-        else:
-            optimizer = FP16_Optimizer_State(
-                optimizer, static_loss_scale=args.loss_scale)
+                              bias_correction=False)
+        # if args.loss_scale == 0:
+        #     optimizer = FP16_Optimizer_State(
+        #         optimizer, dynamic_loss_scale=True)
+        # else:
+        #     optimizer = FP16_Optimizer_State(
+        #         optimizer, static_loss_scale=args.loss_scale)
     else:
         optimizer = BertAdam(optimizer_grouped_parameters,
                              lr=args.learning_rate,
                              warmup=args.warmup_proportion,
                              schedule=args.sche_mode,
                              t_total=t_total)
+
+    if args.amp:
+        model, optimizer = amp.initialize(model, optimizer, opt_level='02')
+
+    if args.local_rank != -1:
+        try:
+            from apex.parallel import DistributedDataParallel as DDP 
+        except ImportError:
+            raise ImportError(
+                'Please install apex from https://www.github.com/nvidia/apex to use distributed fp16 for training.')
+        model = DDP(model)
+    elif n_gpu > 1:
+        model = DataParallelImbalance(model)
+
+
 
     if recover_step:
         logger.info("***** Recover optimizer: %d *****", recover_step)
@@ -432,9 +434,9 @@ def main():
         if hasattr(optim_recover, 'state_dict'):
             optim_recover = optim_recover.state_dict()
         optimizer.load_state_dict(optim_recover)
-        if args.loss_scale == 0:
-            logger.info("***** Recover optimizer: dynamic_loss_scale *****")
-            optimizer.dynamic_loss_scale = True
+        # if args.loss_scale == 0:
+        #     logger.info("***** Recover optimizer: dynamic_loss_scale *****")
+        #     optimizer.dynamic_loss_scale = True
 
     logger.info("***** CUDA.empty_cache() *****")
     torch.cuda.empty_cache()
@@ -463,9 +465,9 @@ def main():
                 batch = [t.to(device) for t in batch]
                 input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx, img, vis_masked_pos, vis_pe, ans_labels = batch
 
-                if args.fp16:
-                    img = img.half()
-                    vis_pe = vis_pe.half()
+                # if args.fp16:
+                #     img = img.half()
+                #     vis_pe = vis_pe.half()
 
                 if args.enable_butd:
                     conv_feats = img.data # Bx100x2048
@@ -567,17 +569,19 @@ def main():
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
 
-                if args.fp16:
+                if args.amp:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
                     optimizer.backward(loss)
-                    if amp_handle:
-                        amp_handle._clear_cache()
+                    # if amp_handle:
+                    #     amp_handle._clear_cache()
                 else:
                     loss.backward()
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     lr_this_step = args.learning_rate * \
                         warmup_linear(global_step/t_total,
                                       args.warmup_proportion)
-                    if args.fp16:
+                    if args.amp:
                         # modify learning rate with special warm up BERT uses
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = lr_this_step

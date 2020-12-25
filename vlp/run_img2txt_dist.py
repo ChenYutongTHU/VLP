@@ -152,6 +152,8 @@ def main():
                         help="The input data file name.")
     parser.add_argument('--enable_visdom', action='store_true')
     parser.add_argument('--visdom_port', type=int, default=8888)
+    parser.add_argument('--enable_tensorboard', action='store_true')
+    parser.add_argument('--summary_steps', type=int, default=100)
     # parser.add_argument('--resnet_model', type=str, default='imagenet_weights/resnet101.pth')
     parser.add_argument('--image_root', type=str, default='/mnt/dat/COCO/images')
     parser.add_argument('--dataset', default='coco', type=str,
@@ -190,7 +192,6 @@ def main():
     args = parser.parse_args()
 
     print('global_rank: {}, local rank: {}'.format(args.global_rank, args.local_rank))
-
     args.max_seq_length = args.max_len_b + args.len_vis_input + 3 # +3 for 2x[SEP] and [CLS]
     args.mask_image_regions = (args.vis_mask_prob > 0) # whether to mask out image regions
     args.dist_url = args.dist_url.replace('[PT_OUTPUT_DIR]', args.output_dir)
@@ -231,8 +232,9 @@ def main():
         device = torch.device("cuda", args.local_rank)
         n_gpu = 1
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.distributed.init_process_group(backend='nccl', init_method = args.dist_url,
-            world_size=args.world_size, rank=args.global_rank)
+        # torch.distributed.init_process_group(backend='nccl', init_method = args.dist_url,
+        #     world_size=args.world_size, rank=args.global_rank)
+        torch.distributed.init_process_group(backend='nccl')
     logger.info("device: {} n_gpu: {}, distributed training: {}, amp training: {}".format(
         device, n_gpu, bool(args.local_rank != -1), args.amp))
 
@@ -255,10 +257,14 @@ def main():
         import visdom
         vis = visdom.Visdom(port=args.visdom_port, env=args.output_dir)
         vis_window={'iter': None, 'score':None}
+    if args.enable_tensorboard:
+        from tensorboardX import SummaryWriter
+        if args.local_rank in [-1,0]:
+            writer = SummaryWriter(args.output_dir)
 
     tokenizer = BertTokenizer.from_pretrained(
         args.bert_model, do_lower_case=args.do_lower_case,
-        cache_dir=args.output_dir+'/.pretrained_model_{}'.format(args.global_rank))
+        cache_dir=args.output_dir+'/.pretrained_model_{}'.format(args.local_rank))
     if args.max_position_embeddings:
         tokenizer.max_len = args.max_position_embeddings
     data_tokenizer = WhitespaceTokenizer() if args.tokenized_input else tokenizer
@@ -290,7 +296,7 @@ def main():
             s2s_prob=args.s2s_prob, bi_prob=args.bi_prob,
             enable_butd=args.enable_butd, tasks=args.tasks)
 
-        if args.world_size == 1:
+        if args.local_rank == -1:
             train_sampler = RandomSampler(train_dataset, replacement=False)
         else:
             train_sampler = DistributedSampler(train_dataset)
@@ -327,7 +333,7 @@ def main():
             type_vocab_size=type_vocab_size, relax_projection=relax_projection,
             config_path=args.config_path, task_idx=task_idx_proj,
             max_position_embeddings=args.max_position_embeddings, label_smoothing=args.label_smoothing,
-            fp32_embedding=args.fp32_embedding, cache_dir=args.output_dir+'/.pretrained_model_{}'.format(args.global_rank),
+            fp32_embedding=args.fp32_embedding, cache_dir=args.output_dir+'/.pretrained_model_{}'.format(args.local_rank),
             drop_prob=args.drop_prob, enable_butd=args.enable_butd,
             len_vis_input=args.len_vis_input, tasks=args.tasks)
         global_step = 0
@@ -350,7 +356,7 @@ def main():
                 type_vocab_size=type_vocab_size, relax_projection=relax_projection,
                 config_path=args.config_path, task_idx=task_idx_proj,
                 max_position_embeddings=args.max_position_embeddings, label_smoothing=args.label_smoothing,
-                fp32_embedding=args.fp32_embedding, cache_dir=args.output_dir+'/.pretrained_model_{}'.format(args.global_rank),
+                fp32_embedding=args.fp32_embedding, cache_dir=args.output_dir+'/.pretrained_model_{}'.format(args.local_rank),
                 drop_prob=args.drop_prob, enable_butd=args.enable_butd,
                 len_vis_input=args.len_vis_input, tasks=args.tasks)
         else:
@@ -587,6 +593,11 @@ def main():
                             param_group['lr'] = lr_this_step
                     optimizer.step()
                     optimizer.zero_grad()
+
+                    if args.enable_tensorboard and global_step%args.summary_steps==0:
+                        if args.local_rank in [-1,0]:
+                            writer.add_scalar('Training_Loss', train_loss[-1], global_step)
+
                     global_step += 1
 
             # Save a trained model
@@ -598,14 +609,14 @@ def main():
                 args.output_dir, "model.{0}.bin".format(i_epoch))
             output_optim_file = os.path.join(
                 args.output_dir, "optim.{0}.bin".format(i_epoch))
-            if args.global_rank in (-1, 0): # save model if the first device or no dist
+            if args.local_rank in (-1, 0): # save model if the first device or no dist
                 torch.save(copy.deepcopy(model_to_save).cpu().state_dict(), output_model_file)
                 # torch.save(optimizer.state_dict(), output_optim_file) # disable for now, need to sanitize state and ship everthing back to cpu
 
             logger.info("***** CUDA.empty_cache() *****")
             torch.cuda.empty_cache()
 
-            if args.world_size > 1:
+            if args.local_rank >= 0:
                 torch.distributed.barrier()
 
 

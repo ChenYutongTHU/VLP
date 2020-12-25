@@ -1,3 +1,10 @@
+eval*.sh
+train*.sh
+download_models
+detectron_weights
+my_requirement.txt
+yutong_experiments
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

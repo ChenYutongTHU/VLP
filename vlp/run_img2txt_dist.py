@@ -18,10 +18,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
-import random
+import random, math
 import copy
 
-from pytorch_pretrained_bert.tokenization import BertTokenizer, WhitespaceTokenizer
+from pytorch_pretrained_bert.tokenization import BertTokenizer, WhitespaceTokenizer, Indexer
+from transformers import XLMTokenizer
 from pytorch_pretrained_bert.modeling import BertForPreTrainingLossMask, BertForSeq2SeqDecoder
 from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
 
@@ -46,10 +47,27 @@ def _get_max_epoch_model(output_dir):
 
 def main():
     parser = argparse.ArgumentParser()
+    # Data augmentation
+    parser.add_argument('--dataset', default='coco', type=str, nargs='*', help='')
+    parser.add_argument('--sampling_alpha', default=0.5, type=float)
+    parser.add_argument('--sampling_beta', default=0.5, type=float)
+    parser.add_argument('--num_samples', default=, type=float)
+    parser.add_argument('--max_len_en', default=20, type=int)
+    parser.add_argument('--max_len_zh', default=20, type=int)
+    parser.add_argument('--len_vis_input', type=int, default=100, help="The length of visual token input")
+
+    parser.add_argument("--src_file", default='$DATA_ROOT/{}/annotations/{}_dataset.json',
+                        type=str, help="The input data file name.")
+    parser.add_argument('--file_valid_jpgs', default='$DATA_ROOT/{}/annotations/{}_valid_jpgs.json', type=str)
+    parser.add_argument('--image_root', type=str, default='$DATA_ROOT/{}/region_feat_gvd_wo_bgd')
+    parser.add_argument('--region_bbox_file', default='raw_bbox/{}_detection_vg_100dets_vlp_checkpoint_trainval_bbox', type=str)
+    parser.add_argument('--region_det_file_prefix', default='feat_cls_1000/{}_detection_vg_100dets_vlp_checkpoint_trainval', type=str)
 
     # General
     parser.add_argument("--bert_model", default="bert-base-cased", type=str,
                         help="Bert pre-trained model selected in the list: bert-base-cased, bert-large-cased.")
+    parser.add_argument("--xml_vocab",type=str, default='./download_models/xml_vocab.json')
+    parser.add_argument("--xml_merge",type=str, default='./download_models/xml_merges.txt')
     parser.add_argument("--config_path", default=None, type=str,
                         help="Bert config file path.")
     parser.add_argument("--output_dir",
@@ -129,10 +147,6 @@ def main():
                         help="Use new segment ids for bi-uni-directional LM.")
     parser.add_argument('--tokenized_input', action='store_true',
                         help="Whether the input is tokenized.")
-    parser.add_argument('--len_vis_input', type=int, default=100,
-                        help="The length of visual token input")
-    parser.add_argument('--max_len_b', type=int, default=20,
-                        help="Truncate_config: maximum length of segment B.")
     parser.add_argument('--trunc_seg', default='b',
                         help="Truncate_config: first truncate segment A/B (option: a, b).")
     parser.add_argument('--always_truncate_tail', action='store_true',
@@ -147,24 +161,18 @@ def main():
                         help="max position embeddings")
 
     # Others for VLP
-    parser.add_argument("--src_file", default=['/mnt/dat/COCO/annotations/dataset_coco.json'],
-                        type=str, nargs='+',
-                        help="The input data file name.")
     parser.add_argument('--enable_visdom', action='store_true')
     parser.add_argument('--visdom_port', type=int, default=8888)
     parser.add_argument('--enable_tensorboard', action='store_true')
     parser.add_argument('--summary_steps', type=int, default=100)
     # parser.add_argument('--resnet_model', type=str, default='imagenet_weights/resnet101.pth')
     parser.add_argument('--image_root', type=str, default='/mnt/dat/COCO/images')
-    parser.add_argument('--dataset', default='coco', type=str,
-                        help='coco | flickr30k | cc')
     parser.add_argument('--split', type=str, nargs='+', default=['train', 'restval'])
 
     parser.add_argument('--world_size', default = 1, type = int,
                         help = 'number of distributed processes')
     parser.add_argument('--dist_url', default='file://[PT_OUTPUT_DIR]/nonexistent_file', type = str,
                         help = 'url used to set up distributed training')
-    parser.add_argument('--file_valid_jpgs', default='/mnt/dat/COCO/annotations/coco_valid_jpgs.json', type=str)
     parser.add_argument('--sche_mode', default='warmup_linear', type=str,
                         help="warmup_linear | warmup_constant | warmup_cosine")
     parser.add_argument('--drop_prob', default=0.1, type=float)
@@ -179,8 +187,6 @@ def main():
                         help="Percentage of examples that are bidirectional LM.")
     parser.add_argument('--enable_butd', action='store_true',
                         help='set to take in region features')
-    parser.add_argument('--region_bbox_file', default='coco_detection_vg_thresh0.2_feat_gvd_checkpoint_trainvaltest.h5', type=str)
-    parser.add_argument('--region_det_file_prefix', default='feat_cls_1000/coco_detection_vg_100dets_gvd_checkpoint_trainval', type=str)
     parser.add_argument('--tasks', default='img2txt',
                         help='img2txt | vqa2')
     parser.add_argument('--relax_projection',
@@ -190,8 +196,19 @@ def main():
                         help='Self-critical sequence training')
 
     args = parser.parse_args()
+    assert len(args.dataset, args.max_len_b)
+    dataset = {}
+    for d, len_b in zip(args.dataset, args.max_len_b):
+        assert d in ['coco','aic','wmt']
+        if d == 'coco':
+            dataset[d] = {'max_len_a': args.len_vis_input, 'max_len_b': args.max_len_en}
+        if d in 'aic':
+            dataset[d] = {'max_len_a': args.len_vis_input, 'max_len_b': args.max_len_zh}
+        elif d in 'wmt':
+            dataset[d] = {'max_len_a': args.max_len_en, 'max_len_b': args.max_len_zh}
+        dataset['max_seq_length'] = dataset['max_len_a'] + dataset['max_len_b'] + 3
 
-    print('global_rank: {}, local rank: {}'.format(args.global_rank, args.local_rank))
+    print('global_rank: {}, local rank: {} Corpora: {}'.format(args.global_rank, args.local_rank, args.dataset))
     args.max_seq_length = args.max_len_b + args.len_vis_input + 3 # +3 for 2x[SEP] and [CLS]
     args.mask_image_regions = (args.vis_mask_prob > 0) # whether to mask out image regions
     args.dist_url = args.dist_url.replace('[PT_OUTPUT_DIR]', args.output_dir)
@@ -208,15 +225,16 @@ def main():
     if args.enable_butd:
         assert(args.len_vis_input == 100)
         args.region_bbox_file = os.path.join(args.image_root, args.region_bbox_file)
-        args.region_det_file_prefix = os.path.join(args.image_root, args.region_det_file_prefix) if args.dataset in ('cc', 'coco') and args.region_det_file_prefix != '' else ''
-
+        #args.region_det_file_prefix = os.path.join(args.image_root, args.region_det_file_prefix) if args.dataset in ('cc', 'coco') and args.region_det_file_prefix != '' else ''
+        args.region_det_file_prefix = os.path.join(args.image_root, args.region_det_file_prefix)  # not support flickr30k now
     # output config
-    os.makedirs(args.output_dir, exist_ok=True)
-    json.dump(args.__dict__, open(os.path.join(
-        args.output_dir, 'opt.json'), 'w'), sort_keys=True, indent=2)
+    if args.local_rank in [-1,0]:
+        os.makedirs(args.output_dir, exist_ok=True)
+        json.dump(args.__dict__, open(os.path.join(
+            args.output_dir, 'opt.json'), 'w'), sort_keys=True, indent=2)
 
     logging.basicConfig(
-        filename=os.path.join(args.output_dir, args.log_file),
+        filename=os.path.join(args.output_dir, 'rank{}_'.format(args.local_rank)+args.log_file),
         filemode='w',
         format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
         datefmt='%m/%d/%Y %H:%M:%S',
@@ -262,46 +280,87 @@ def main():
         if args.local_rank in [-1,0]:
             writer = SummaryWriter(args.output_dir)
 
-    tokenizer = BertTokenizer.from_pretrained(
+    tokenizer_en = BertTokenizer.from_pretrained(
         args.bert_model, do_lower_case=args.do_lower_case,
-        cache_dir=args.output_dir+'/.pretrained_model_{}'.format(args.local_rank))
+        cache_dir=args.output_dir+'/.pretrained_model')
     if args.max_position_embeddings:
-        tokenizer.max_len = args.max_position_embeddings
-    data_tokenizer = WhitespaceTokenizer() if args.tokenized_input else tokenizer
+        tokenizer_en.max_len = args.max_position_embeddings
+    tokenizer_en= WhitespaceTokenizer() if args.tokenized_input else tokenizer_en
+    tokenizers = {'en':tokenizer_en}
+
+    if 'aic' in args.dataset or 'wmt' in args.dataset:
+        tokenizer_zh = XLMTokenizer.from_pretrained(args.xml_vocab, args.xml_merge)
+        tokenizers['zh'] = tokenizer_zh
+
+    indexer = Indexer([os.path.join(args.bert_model,'vocab.txt'), args.xml_vocab])
 
     if args.do_train:
-        bi_uni_pipeline = [seq2seq_loader.Preprocess4Seq2seq(args.max_pred, args.mask_prob,
-            list(tokenizer.vocab.keys()), tokenizer.convert_tokens_to_ids, args.max_seq_length,
-            new_segment_ids=args.new_segment_ids, truncate_config={
-            'max_len_b': args.max_len_b, 'trunc_seg': args.trunc_seg, 'always_truncate_tail':
-            args.always_truncate_tail}, mask_image_regions=args.mask_image_regions,
-            mode="s2s", len_vis_input=args.len_vis_input,
-            vis_mask_prob=args.vis_mask_prob, enable_butd=args.enable_butd,
-            region_bbox_file=args.region_bbox_file, region_det_file_prefix=args.region_det_file_prefix,
-            local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2'))]
-        bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seq(args.max_pred, args.mask_prob,
-            list(tokenizer.vocab.keys()), tokenizer.convert_tokens_to_ids, args.max_seq_length,
-            new_segment_ids=args.new_segment_ids, truncate_config={
-            'max_len_b': args.max_len_b, 'trunc_seg': args.trunc_seg, 'always_truncate_tail':
-            args.always_truncate_tail}, mask_image_regions=args.mask_image_regions,
-            mode="bi", len_vis_input=args.len_vis_input,
-            vis_mask_prob=args.vis_mask_prob, enable_butd=args.enable_butd,
-            region_bbox_file=args.region_bbox_file, region_det_file_prefix=args.region_det_file_prefix,
-            local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2')))
 
-        train_dataset = seq2seq_loader.Img2txtDataset(
-            args.src_file, args.image_root, args.split, args.train_batch_size,
-            data_tokenizer, args.max_seq_length, file_valid_jpgs=args.file_valid_jpgs,
-            bi_uni_pipeline=bi_uni_pipeline, use_num_imgs=args.use_num_imgs,
-            s2s_prob=args.s2s_prob, bi_prob=args.bi_prob,
-            enable_butd=args.enable_butd, tasks=args.tasks)
+        for corpus in args.dataset:
+            if corpus in ['coco', 'aic']:
+                tokenizer = tokenizers['en'] if corpus=='coco' else tokenizers[zh]
+                bi_uni_pipeline = [seq2seq_loader.Preprocess4Seq2seq(args.max_pred, args.mask_prob,
+                    list(tokenizer.vocab.keys()), indexer, args.dataset[corpus]['max_seq_length'],
+                    new_segment_ids=args.new_segment_ids,  #to-do?
+                    truncate_config={
+                        'max_len_b': args.dataset[corpus]['max_len_b'], 'trunc_seg': args.trunc_seg, 'always_truncate_tail':
+                        args.always_truncate_tail}, 
+                    mask_image_regions=args.mask_image_regions,
+                    mode="s2s", len_vis_input=args.len_vis_input,
+                    vis_mask_prob=args.vis_mask_prob, enable_butd=args.enable_butd,
+                    region_bbox_file=args.region_bbox_file.format(corpus.upper(), corpus.lower()), 
+                    region_det_file_prefix=args.region_det_file_prefix.format(corpus.upper(), corpus.lower()),
+                    local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2'))]
 
+                bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seq(args.max_pred, args.mask_prob,
+                    list(tokenizer.vocab.keys()), indexer, args.dataset[corpus]['max_seq_length'],
+                    new_segment_ids=args.new_segment_ids,  #to-do?
+                    truncate_config={
+                        'max_len_b': args.dataset[corpus]['max_len_b'], 'trunc_seg': args.trunc_seg, 'always_truncate_tail':
+                        args.always_truncate_tail}, 
+                    mask_image_regions=args.mask_image_regions,
+                    mode="bi", len_vis_input=args.len_vis_input,
+                    vis_mask_prob=args.vis_mask_prob, enable_butd=args.enable_butd,
+                    region_bbox_file=args.region_bbox_file.format(corpus.upper(), corpus.lower()), 
+                    region_det_file_prefix=args.region_det_file_prefix.format(corpus.upper(), corpus.lower()),
+                    local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2')))
+
+                args.dataset[corpus]['train_dataset'] = seq2seq_loader.Img2txtDataset(
+                    args.src_file.format(corpus.upper(), corpus.lower()), 
+                    args.image_root.format(corpus.upper()), 
+                    args.split, args.train_batch_size,
+                    tokenizer, 
+                    args.dataset[corpus]['max_seq_length'], 
+                    file_valid_jpgs=args.file_valid_jpgs.format(corpus.upper(), corpus.lower()),
+                    bi_uni_pipeline=bi_uni_pipeline, use_num_imgs=args.use_num_imgs,
+                    s2s_prob=args.s2s_prob, bi_prob=args.bi_prob,
+                    enable_butd=args.enable_butd, tasks=args.tasks)
+
+            elif corpus == 'wmt':
+                args.dataset[corpus]['train_dataset'] = seq2seq_loader.Txt2txtDataset()   #to-do
+
+        train_dataset = seq2seq_loader.CombinedDataset(
+                    datasets_dict={c: args.dataset[c]['train_dataset'] for c in args.dataset})
         if args.local_rank == -1:
-            train_sampler = RandomSampler(train_dataset, replacement=False)
+            #train_sampler = RandomSampler(train_dataset, replacement=False)
+            logger.info('************Data statistics******************')
+            num_samples = []
+            total_num_samples = 0
+            for corpus in args.dataset:
+                N = len(args.dataset[corpus]['train_dataset'])
+                logger.info('{} #{}'.format(corpus, N))
+                num_samples.append(N)
+                total_num_samples += N
+            logger.info('total number samples {}'.format(total_num_samples))
+            trainer_batch_sampler = WeightedRandom_BatchSampler(
+                num_samples, args.train_batch_size,
+                args.sampling_alpha, num_batch=int(total_num_samples*args.sampling_beta/args.train_batch_size),
+                drop_last=False)
         else:
             train_sampler = DistributedSampler(train_dataset)
+
         train_dataloader = torch.utils.data.DataLoader(train_dataset,
-            batch_size=args.train_batch_size, sampler=train_sampler, num_workers=args.num_workers,
+            batch_sampler=train_batch_sampler, num_workers=args.num_workers,
             collate_fn=batch_list_to_batch_tensors, pin_memory=True)
 
     # note: args.train_batch_size has been changed to (/= args.gradient_accumulation_steps)
@@ -320,8 +379,7 @@ def main():
     type_vocab_size = 6 if args.new_segment_ids else 2
     relax_projection = 4 if args.relax_projection else 0
     task_idx_proj = 3 if args.tasks == 'img2txt' else 0
-    mask_word_id, eos_word_ids, pad_word_ids = tokenizer.convert_tokens_to_ids(
-        ["[MASK]", "[SEP]", "[PAD]"]) # index in BERT vocab: 103, 102, 0
+    mask_word_id, eos_word_ids, pad_word_ids = indexer(["[MASK]", "[SEP]", "[PAD]"]) # index in BERT vocab: 103, 102, 0
 
     if (recover_step is None) and (args.model_recover_path is None):
         # if _state_dict == {}, the parameters are randomly initialized

@@ -26,6 +26,7 @@ import collections
 import unicodedata
 import os
 import logging
+import json
 
 from .file_utils import cached_path
 
@@ -51,8 +52,20 @@ PRETRAINED_VOCAB_POSITIONAL_EMBEDDINGS_SIZE_MAP = {
 }
 VOCAB_NAME = 'vocab.txt'
 
+class Indexer:
+    def __init__(self, vocab_files):
+        self.vocab = load_vocab(vocab_files)
+    def __call__(self, tokens):
+        """Converts a sequence of tokens into ids using the vocab."""
+        ids = []
+        for token in tokens:
+            if token not in self.vocab:
+                print(token)
+                raise
+            ids.append(self.vocab[token])
+        return ids
 
-def load_vocab(vocab_file):
+def load_vocab(vocab_files):
     """Loads a vocabulary file into a dictionary."""
     # mapping unused tokens to special tokens
     extra_map = {}
@@ -62,16 +75,30 @@ def load_vocab(vocab_file):
 
     vocab = collections.OrderedDict()
     index = 0
-    with open(vocab_file, "r", encoding="utf-8") as reader:
-        while True:
-            token = reader.readline()
-            if not token:
-                break
-            token = token.strip()
-            if token in extra_map:
-                token = extra_map[token]
-            vocab[token] = index
-            index += 1
+    for i, file in enumerate(vocab_files):
+        assert os.path.isfile(file)
+        if i==0:
+            assert '.txt' in file #must be bert
+        if '.txt' in file:
+            with open(file, "r", encoding="utf-8") as reader:
+                while True:
+                    token = reader.readline()
+                    if i==0:
+                        assert len(token)==28996 #must be bert
+                    if not token:
+                        break
+                    token = token.strip()
+                    if token in extra_map:
+                        token = extra_map[token]
+                    vocab[token] = index
+                    index += 1
+        elif '.json' in file:
+            with open(file, 'r') as f:
+                xlm_vocab = json.load(f)
+            for token in xlm_vocab:
+                if not token in vocab:
+                    vocab[token] = index #do not overwrite 
+                    index += 1
     return vocab
 
 
@@ -92,7 +119,7 @@ class BertTokenizer(object):
             raise ValueError(
                 "Can't find a vocabulary file at path '{}'. To load the vocabulary from a Google pretrained "
                 "model use `tokenizer = BertTokenizer.from_pretrained(PRETRAINED_MODEL_NAME)`".format(vocab_file))
-        self.vocab = load_vocab(vocab_file)
+        self.vocab = load_vocab([vocab_file])
         # print('self.vocab', len(self.vocab))
         self.ids_to_tokens = collections.OrderedDict(
             [(ids, tok) for tok, ids in self.vocab.items()])
@@ -391,3 +418,5 @@ def _is_punctuation(char):
     if cat.startswith("P"):
         return True
     return False
+
+

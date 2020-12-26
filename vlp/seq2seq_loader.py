@@ -59,6 +59,15 @@ def truncate_tokens_pair(tokens_a, tokens_b, max_len, max_len_a=0, max_len_b=0, 
             num_truncated[1] += 1
     return num_truncated_a, num_truncated_b
 
+class Txt2txtDatset(torch.utils.data.Dataset): #to-do
+    def __init__(self):
+        super().__init__()
+    def __len__(self):
+        pass
+    def __getitem__(self, idx):
+        pass
+    def __iter__(self):  # iterator to load data
+        pass
 
 class Img2txtDataset(torch.utils.data.Dataset):
     """ Load image-sentence pairs """
@@ -80,8 +89,7 @@ class Img2txtDataset(torch.utils.data.Dataset):
         self.ex_list = []
 
         if tasks == 'img2txt':
-            assert(len(file_src) == 1)
-            with open(file_src[0], "r", encoding='utf-8') as f_src:
+            with open(file_src, "r", encoding='utf-8') as f_src:
                 # raw inputs are given
                 img_dat = json.load(f_src)['images']
                 counter = 0
@@ -133,7 +141,7 @@ class Img2txtDataset(torch.utils.data.Dataset):
                                 # check if the image is valid
                                 if src['filename'] in valid_jpgs:
                                     for sent in src['sentences']:
-                                        tgt_tk = tokenizer.tokenize(sent['raw'])
+                                        tgt_tk = tokenizer.tokenize(sent['raw'])  #to-do Chinese Tokenizer.tokenize?
                                         assert len(tgt_tk) > 0
                                         self.ex_list.append((src_tk, tgt_tk, {'answers': ['dummy']}))
                                         # if counter%10000 == 0:
@@ -471,3 +479,49 @@ class Preprocess4Seq2seqDecoder(Pipeline):
                 F.layer_norm(cls_label, [1601])), dim=-1) # 1601 hard coded...
 
         return (input_ids, segment_ids, position_ids, input_mask, self.task_idx, img, vis_pe)
+
+class CombinedDataset(torch.utils.data.Dataset):
+    def __init__(self, datasets_dict):
+        super().__init__() #sample strategy using a ratio
+        self.datasets_dict = datasets_dict
+        self.datasets = [self.datasets_dict[key] for key in self.datasets_dict]
+
+    def __len__(self):
+        pass
+    def __getitem__(self): #to-do
+        #sample strategy 
+        pass 
+
+class WeightedRandom_BatchSampler(torch.utils.data.Sampler):
+    def __init__(self, corpus_size, batch_size, alpha, num_batches, drop_last=False):
+        self.batch_size=batch_size
+        self.drop_last=drop_last
+        self.alpha = alpha
+        self.num_batches = num_batches
+        self.corpus_size = corpus_size
+    def __iter__(self):
+        all_batches = []
+        cnt = 0
+        weights = []
+        for cs in self.corpus_size:
+            shuffled_indices =(torch.randperm(cs)+cnt).tolist()
+            i = 0
+            while i<cs:
+                if i+self.batch_size>cs:
+                    if self.drop_last:
+                        break
+                    else:
+                        all_batches.append(shuffled_indices[i:]+shuffled_indices[0:self.batch_size-(cs-i)])
+                        weights.append(math.pow(cs, self.alpha))
+                else:
+                    all_batches.append(shuffled_indices[i:i+self.batch_size])
+                    weights.append(math.pow(cs, self.alpha))
+
+                i += self.batch_size
+            cnt += cs
+        batch_indices = torch.multinomial(torch.tensor(weights,dtype=torch.float32), self.num_batches, replacement=False)
+        for ind in batch_indices:
+            yield all_batches[ind] 
+
+    def __len__(self):
+        return self.num_batches     

@@ -1343,7 +1343,8 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
                     ids = torch.reshape(
                         ids, id_shape + [1] * (x_rank - id_rank))
                     ids = ids.expand(id_shape + x_shape[1:])
-                y = torch.gather(x, 1, ids)
+                #print(ids.dtype)
+                y = torch.gather(x, 1, ids.long())
                 y = torch.reshape(y, x_shape)
                 return y
 
@@ -1466,7 +1467,8 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
             else:
                 seq = [wids_list[frame_id][pos_in_frame]]
                 for fid in range(frame_id, 0, -1):
-                    pos_in_frame = ptrs[fid][pos_in_frame]
+                    pos_in_frame = int(ptrs[fid][pos_in_frame])
+                    #print(type(fid-1),type(pos_in_frame))
                     seq.append(wids_list[fid - 1][pos_in_frame])
                 seq.reverse()
                 traces['pred_seq'].append(seq)

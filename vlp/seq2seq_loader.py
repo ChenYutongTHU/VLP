@@ -446,7 +446,7 @@ class Preprocess4Seq2seqDecoder(Pipeline):
                 # read data from h5 files
                 with h5py.File(self.region_det_file_prefix+'_feat'+img_id[-1:] +'.h5', 'r') as region_feat_f, \
                         h5py.File(self.region_det_file_prefix+'_cls'+img_id[-1:] +'.h5', 'r') as region_cls_f, \
-                        h5py.File(self.region_bbox_file, 'r') as region_bbox_f:
+                        h5py.File(self.region_bbox_file+img_id[-1:]+'.h5', 'r') as region_bbox_f:
                     img = torch.from_numpy(region_feat_f[img_id][:]).float()
                     cls_label = torch.from_numpy(region_cls_f[img_id][:]).float()
                     vis_pe = torch.from_numpy(region_bbox_f[img_id][:])

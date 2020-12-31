@@ -57,12 +57,16 @@ class Indexer:
         self.vocab = load_vocab(vocab_files)
     def __call__(self, tokens):
         """Converts a sequence of tokens into ids using the vocab."""
+        if type(tokens)==str:
+            return self.vocab[tokens]
+
         ids = []
         for token in tokens:
             if token not in self.vocab:
-                print(token)
-                raise
-            ids.append(self.vocab[token])
+                ids.append(self.vocab['[UNK]'])
+                print(token, self.vocab['[UNK]'])
+            else:
+                ids.append(self.vocab[token])
         return ids
 
 def load_vocab(vocab_files):
@@ -83,8 +87,8 @@ def load_vocab(vocab_files):
             with open(file, "r", encoding="utf-8") as reader:
                 while True:
                     token = reader.readline()
-                    if i==0:
-                        assert len(token)==28996 #must be bert
+                    # if i==0:
+                    #     assert len(token)==28996, len(token) #must be bert
                     if not token:
                         break
                     token = token.strip()
@@ -92,6 +96,7 @@ def load_vocab(vocab_files):
                         token = extra_map[token]
                     vocab[token] = index
                     index += 1
+                assert len(vocab)==28996, len(vocab) #must be bert
         elif '.json' in file:
             with open(file, 'r') as f:
                 xlm_vocab = json.load(f)
@@ -194,6 +199,7 @@ class BertTokenizer(object):
             max_len = PRETRAINED_VOCAB_POSITIONAL_EMBEDDINGS_SIZE_MAP[pretrained_model_name]
             kwargs['max_len'] = min(kwargs.get('max_len', int(1e12)), max_len)
         # Instantiate tokenizer.
+        #print('vocab_file {}'.format(resolved_vocab_file))
         tokenizer = cls(resolved_vocab_file, *inputs, **kwargs)
         return tokenizer
 

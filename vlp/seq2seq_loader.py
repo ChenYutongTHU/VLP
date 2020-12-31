@@ -19,8 +19,15 @@ import os
 import imghdr
 import numpy as np
 import h5py
-import tqdm
+import tqdm, time
 
+NEW_SEGMENT_IDS = {
+    'bi_img':0, 'bi_en_cap':1, 'bi_zh_cap':6,
+    's2s_img':4, 's2s_en_cap':5, 's2s_zh_cap':7,
+    'bi_en':8, 'bi_zh':9,
+    's2s_en':10,'s2s_zh':11}
+SEGMENT_IDS = {
+    'img':0, 'en':1, 'zh':6}
 
 def truncate_tokens_pair(tokens_a, tokens_b, max_len, max_len_a=0, max_len_b=0, trunc_seg=None, always_truncate_tail=False):
     num_truncated_a = [0, 0]
@@ -59,20 +66,72 @@ def truncate_tokens_pair(tokens_a, tokens_b, max_len, max_len_a=0, max_len_b=0, 
             num_truncated[1] += 1
     return num_truncated_a, num_truncated_b
 
-class Txt2txtDatset(torch.utils.data.Dataset): #to-do
-    def __init__(self):
+class Txt2txtDataset(torch.utils.data.Dataset): #to-do
+    def __init__(self, file_src, split, batch_size, tokenizers, max_len, preprocessed=True,
+        short_sampling_prob=0.1, sent_reverse_order=False, bi_uni_pipeline=[], s2s_prob=1, bi_prob=0):
         super().__init__()
+        self.tokenizers = tokenizers #{'zh': ,'en'}
+        self.max_len = max_len  # maximum length of tokens
+        self.short_sampling_prob = short_sampling_prob #?
+        self.bi_uni_pipeline = bi_uni_pipeline
+        self.batch_size = batch_size
+        self.sent_reverse_order = sent_reverse_order
+        self.s2s_prob = s2s_prob
+        self.bi_prob = bi_prob
+        self.preprocessed = preprocessed
+        print('Txt2txt Sample seq2seq {} and bidirectional {}'.format(self.s2s_prob, self.bi_prob))
+        assert(self.s2s_prob + self.bi_prob == 1)
+
+        if preprocessed:
+            file_src = file_src.split('.')[0]+'_preprocessed.json'#'wmt_dataset.json' -> 'wmt_pretokenized'
+            print('Loading preprocessed {}'.format(file_src))
+            start = time.time()
+            assert len(split)==1, split
+            with open(file_src, 'r') as f:
+                self.bilingual_corpus_preprocessed = json.load(f)
+            self.bilingual_corpus_preprocessed = self.bilingual_corpus_preprocessed[split[0]]
+            print('Finish Loading {}. Time cost {}'.format(file_src, round(time.time()-start, 2)))
+
+            self.ex_list = []
+            for en, zh in self.bilingual_corpus_preprocessed:
+                self.ex_list.append([en, zh])
+
+
+
+        else:
+            print('Loading {} ...'.format(file_src))
+            with open(file_src, 'r') as f:
+                self.bilingual_corpus_raw = json.load(f)
+                self.bilingual_corpus_raw = self.bilingual_corpus_raw[split[0]]  #only support training set now to-do
+
+            print('Tokenizing Bilingual Corpus ...')
+            self.ex_list = []
+            for en, zh in tqdm.tqdm(self.bilingual_corpus_raw):
+                en_t = self.tokenizers['en'].tokenize(en)
+                zh_t = self.tokenizers['zh'].tokenize(zh)
+                self.ex_list.append([en_t, zh_t])
+
     def __len__(self):
-        pass
+        return len(self.ex_list)
+
     def __getitem__(self, idx):
-        pass
+        instance = self.ex_list[idx]  #en_t, zh_t
+        proc = choices(self.bi_uni_pipeline, weights=[self.s2s_prob, self.bi_prob])[0]
+        instance = proc(instance)
+        return instance
     def __iter__(self):  # iterator to load data
-        pass
+        for __ in range(math.ceil(len(self.ex_list) / float(self.batch_size))):
+            batch = []
+            for __ in range(self.batch_size):
+                idx = randint(0, len(self.ex_list)-1)
+                batch.append(self.__getitem__(idx))
+            # To Tensor
+            yield batch_list_to_batch_tensors(batch)
 
 class Img2txtDataset(torch.utils.data.Dataset):
     """ Load image-sentence pairs """
 
-    def __init__(self, file_src, image_root, split, batch_size, tokenizer, max_len, file_valid_jpgs='tmp.json', use_num_imgs=-1, short_sampling_prob=0.1, sent_reverse_order=False, bi_uni_pipeline=[], s2s_prob=1, bi_prob=0, enable_butd=False, tasks='img2txt'):
+    def __init__(self, file_src, image_root, split, batch_size, tokenizer, max_len, preprocessed=True, file_valid_jpgs='tmp.json', use_num_imgs=-1, short_sampling_prob=0.1, sent_reverse_order=False, bi_uni_pipeline=[], s2s_prob=1, bi_prob=0, enable_butd=False, tasks='img2txt'):
         super().__init__()
         self.tokenizer = tokenizer  # tokenize function
         self.max_len = max_len  # maximum length of tokens
@@ -82,13 +141,16 @@ class Img2txtDataset(torch.utils.data.Dataset):
         self.sent_reverse_order = sent_reverse_order
         self.s2s_prob = s2s_prob
         self.bi_prob = bi_prob
-        print('Sample seq2seq {} and bidirectional {}'.format(self.s2s_prob, self.bi_prob))
+        self.preprocessed = preprocessed
+        print('Img2txt Sample seq2seq {} and bidirectional {}'.format(self.s2s_prob, self.bi_prob))
         assert(self.s2s_prob + self.bi_prob == 1)
 
         # read the file into memory
         self.ex_list = []
 
         if tasks == 'img2txt':
+            if self.preprocessed:
+                file_src = file_src.split('.')[0]+'_preprocessed.json'
             with open(file_src, "r", encoding='utf-8') as f_src:
                 # raw inputs are given
                 img_dat = json.load(f_src)['images']
@@ -103,11 +165,14 @@ class Img2txtDataset(torch.utils.data.Dataset):
                                     src_tk = os.path.join(image_root, src.get('filepath', 'trainval'),
                                         src['filename'][:-4]+'.npy')
                                     for sent in src['sentences']:
-                                        tgt_tk = tokenizer.tokenize(sent['raw'])
+                                        if self.preprocessed:
+                                            tgt_tk = sent['indices']
+                                        else:
+                                            tgt_tk = tokenizer.tokenize(sent['raw'])
                                         assert len(tgt_tk) > 0
                                         self.ex_list.append((src_tk, tgt_tk, {'answers': ['dummy']}))
-                                        if counter%10000 == 0:
-                                            print(src_tk, tgt_tk)
+                                        #if counter%10000 == 0:
+                                            #print(src_tk, tgt_tk)
                                     counter += 1
                                 else:
                                     src_tk = os.path.join(image_root, src.get('filepath', ''),
@@ -141,7 +206,10 @@ class Img2txtDataset(torch.utils.data.Dataset):
                                 # check if the image is valid
                                 if src['filename'] in valid_jpgs:
                                     for sent in src['sentences']:
-                                        tgt_tk = tokenizer.tokenize(sent['raw'])  #to-do Chinese Tokenizer.tokenize?
+                                        if self.preprocessed:
+                                            tgt_tk = sent['indices']
+                                        else:
+                                            tgt_tk = tokenizer.tokenize(sent['raw'])  #to-do Chinese Tokenizer.tokenize?
                                         assert len(tgt_tk) > 0
                                         self.ex_list.append((src_tk, tgt_tk, {'answers': ['dummy']}))
                                         # if counter%10000 == 0:
@@ -184,11 +252,137 @@ class Img2txtDataset(torch.utils.data.Dataset):
             # To Tensor
             yield batch_list_to_batch_tensors(batch)
 
+class Preprocess4Seq2seqBilingual(Pipeline):
+    def __init__(self, max_pred, mask_prob, vocab_words, indexer, max_len, preprocessed=True,
+        new_segment_ids=False, truncate_config={}, mode="s2s", local_rank=-1):
+        super().__init__()
+        #default a-en b-zh
+        self.max_pred = max_pred  # max tokens of prediction
+        self.mask_prob = mask_prob  # masking probability
+        self.vocab_words = vocab_words  # vocabulary (sub)words
+        self.indexer = indexer  # function from token to token index 
+        self._tril_matrix = torch.tril(torch.ones(
+            (max_len, max_len), dtype=torch.long))
+        self.new_segment_ids = new_segment_ids
+        self.always_truncate_tail = truncate_config.get(
+            'always_truncate_tail', False)   
+        self.max_len_a = truncate_config.get('max_len_a', None)  #
+        self.max_len_b = truncate_config.get('max_len_b', None)
+        self.trunc_seg = None  # truncate the longer segment   
+        self.preprocessed = preprocessed
+
+        assert mode in ("s2s", "bi")
+        self.mode = mode  
+        if mode == 's2s':
+            self.task_idx = 3   # relax projection layer for different tasks
+        elif mode == 'bi':
+            self.task_idx = 0
+
+    def __call__(self, instance):
+        tokens_a, tokens_b = instance[:2] #[CLS] [SEP] [SEP] unincluded #en zh
+
+        truncate_tokens_pair(tokens_en, tokens_zh,
+            self.max_len_a+self.max_len_b, max_len_a=self.max_len_a, max_len_b=self.max_len_b,
+            trunc_seg=self.trunc_seg, always_truncate_tail=self.always_truncate_tail)
+        if self.preprocessed:
+            tokens = self.indexer(['[CLS]']) + tokens_a + self.indexer(['[SEP]']) + tokens_b + self.indexer(['[SEP]'])
+        else:
+            tokens = ['[CLS]'] + tokens_a + ['[SEP]'] + tokens_b + ['[SEP]']
+
+        if self.new_segment_ids:
+            if self.mode == 's2s':
+                segment_ids = NEW_SEGMENT_IDS['s2s_en'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['s2s_zh'] * (len(tokens_b)+1)
+            elif self.mode == 'bi':
+                segment_ids = NEW_SEGMENT_IDS['bi_en'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['bi_zh'] * (len(tokens_b)+1)
+        else:
+            segment_ids = SEGMENT_IDS['en'] * (len(tokens_a)+2) + SEGMENT_IDS['zh'] * (len(tokens_b)+1)
+
+        effective_length = len(tokens_a + tokens_b)
+        n_pred = min(self.max_pred, max(
+            1, int(round(effective_length * self.mask_prob))))
+
+
+        # candidate positions of masked tokens
+        cand_pos = []
+        special_pos = set()
+
+        if rand()<0.5: #mask En a:
+            mask_type = 'a'
+        else: # mask en b
+            mask_type = 'b'
+        for i, tk in enumerate(tokens):
+            #for bilingual dataset, we can mask both tokens
+            if not self.preprocessed and tk in ['[CLS]', '[SEP]']:
+                special_pos.add(i)
+            elif self.preprocessed and tk in self.indexer(['[CLS]','[SEP]']):
+                special_pos.add(i)
+            else:
+                if mask_type=='a' and i<1+len(tokens_a):
+                    cand_pos.append(i)
+                elif mask_type=='b' and i>=2+len(tokens_a):
+                    cand_pos.append(i)
+        shuffle(cand_pos)
+
+        masked_pos = cand_pos[:n_pred]
+        masked_tokens = [tokens[pos] for pos in masked_pos]
+        for pos in masked_pos:
+            if rand() < 0.8:  # 80%
+                tokens[pos] =  '[MASK]' 
+            elif rand() < 0.5:  # 10%
+                if mask_type=='a':
+                    tokens[pos] = get_random_word(list(self.tokenizers['en'].vocab.keys()))
+                else:
+                    tokens[pos] = get_random_word(list(self.tokenizers['zh'].vocab.keys()))
+
+            if self.preprocessed:
+                tokens[pos] = self.indexer(tokens[pos])
+
+        masked_weights = [1]*len(masked_tokens)
+
+        # Token Indexing #to-check
+        if not self.preprocessed:
+            input_ids = self.indexer(tokens)
+            masked_ids = self.indexer(masked_tokens)
+        else:
+            input_ids = tokens
+            masked_ids = masked_tokens
+
+        # Zero Padding
+        n_pad = self.max_len - len(input_ids)
+        input_ids.extend([0] * n_pad)
+        segment_ids.extend([0] * n_pad)
+
+        #attention mask
+        input_mask = torch.zeros(self.max_len, self.max_len, dtype=torch.long)
+        if mask_type=='a':
+            second_st, second_end = 0, len(tokens_a)+2
+        else:
+            second_st, second_end = len(tokens_a)+2, len(tokens_a)+len(tokens_b)+3
+
+        if self.mode == "s2s": #to-check
+            if mask_type=='a':
+                input_mask[:, len(tokens_a)+2:len(tokens_a)+len(tokens_b)+3].fill_(1) #all attend to zh
+            else:
+                input_mask[:, :len(tokens_a)+2].fill_(1) #all attend to en 
+            input_mask[second_st:second_end, second_st:second_end].copy_(
+                self._tril_matrix[:second_end-second_st, :second_end-second_st])
+        else:
+            input_mask = torch.tensor([1] * len(tokens) + [0] * n_pad, dtype=torch.long) \
+                .unsqueeze(0).expand(self.max_len, self.max_len).clone() #do not attend to zero_pad tokens
+
+        # Zero Padding for masked target
+        if self.max_pred > n_pred:
+            n_pad = self.max_pred - n_pred
+            masked_ids.extend([0] * n_pad)
+            masked_pos.extend([0] * n_pad)
+            masked_weights.extend([0] * n_pad)
+
+        return (input_ids, segment_ids, input_mask, masked_ids, masked_pos, masked_weights, -1, self.task_idx)#, img, vis_masked_pos, vis_pe, ans_tk)
 
 class Preprocess4Seq2seq(Pipeline):
     """ Pre-processing steps for pretraining transformer """
 
-    def __init__(self, max_pred, mask_prob, vocab_words, indexer, max_len=512, block_mask=False, new_segment_ids=False, truncate_config={}, mask_image_regions=False, mode="s2s", len_vis_input=49, vis_mask_prob=0.25, enable_butd=False, region_bbox_file='', region_det_file_prefix='', local_rank=-1, load_vqa_ann=False):
+    def __init__(self, max_pred, mask_prob, vocab_words, indexer, preprocessed=True, max_len=512, block_mask=False, new_segment_ids=False, truncate_config={}, mask_image_regions=False, mode="s2s", len_vis_input=49, vis_mask_prob=0.25, enable_butd=False, region_bbox_file='', region_det_file_prefix='', local_rank=-1, load_vqa_ann=False, lang='en'):
         super().__init__()
         self.max_pred = max_pred  # max tokens of prediction
         self.mask_prob = mask_prob  # masking probability
@@ -207,6 +401,8 @@ class Preprocess4Seq2seq(Pipeline):
         self.mode = mode
         self.region_bbox_file = region_bbox_file
         self.region_det_file_prefix = region_det_file_prefix
+        self.lang = lang
+        self.preprocessed = preprocessed
 
         if mode == 's2s':
             self.task_idx = 3   # relax projection layer for different tasks
@@ -237,22 +433,28 @@ class Preprocess4Seq2seq(Pipeline):
 
     def __call__(self, instance):
         img_path, tokens_b = instance[:2]
+        
         tokens_a = ['[UNK]'] * self.len_vis_input
+        if self.preprocessed:
+            tokens_a = self.indexer(tokens_a)
 
         truncate_tokens_pair(tokens_a, tokens_b,
             self.len_vis_input + self.max_len_b, max_len_b=self.max_len_b,
             trunc_seg=self.trunc_seg, always_truncate_tail=self.always_truncate_tail)
 
         # Add Special Tokens
-        tokens = ['[CLS]'] + tokens_a + ['[SEP]'] + tokens_b + ['[SEP]']
+        if self.preprocessed:
+            tokens = self.indexer(['[CLS]']) + tokens_a + self.indexer(['[SEP]']) + tokens_b + self.indexer(['[SEP]'])
+        else:
+            tokens = ['[CLS]'] + tokens_a + ['[SEP]'] + tokens_b + ['[SEP]']
 
         if self.new_segment_ids:
             if self.mode == 's2s':
-                segment_ids = [4] * (len(tokens_a)+2) + [5] * (len(tokens_b)+1)
+                segment_ids = NEW_SEGMENT_IDS['s2s_img'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['s2s_'+self.lang] * (len(tokens_b)+1)
             elif self.mode == 'bi':
-                segment_ids = [0] * (len(tokens_a)+2) + [1] * (len(tokens_b)+1)
+                segment_ids = NEW_SEGMENT_IDS['bi_img'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['bi_'+self.lang] * (len(tokens_b)+1)
         else:
-            segment_ids = [0] * (len(tokens_a)+2) + [1] * (len(tokens_b)+1)
+            segment_ids = SEGMENT_IDS['img'] * (len(tokens_a)+2) + SEGMENT_IDS[self.lang] * (len(tokens_b)+1)
 
         # For masked Language Models
         # the number of prediction is sometimes less than max_pred when sequence is short
@@ -265,7 +467,7 @@ class Preprocess4Seq2seq(Pipeline):
         for i, tk in enumerate(tokens):
             # only mask tokens_b (target sequence)
             # we will mask [SEP] as an ending symbol
-            if (i >= len(tokens_a)+2) and (tk != '[CLS]'):
+            if (i >= len(tokens_a)+2): #and (tk != '[CLS]'):
                 cand_pos.append(i)
             else:
                 special_pos.add(i)
@@ -285,12 +487,18 @@ class Preprocess4Seq2seq(Pipeline):
                 tokens[pos] = '[MASK]'
             elif rand() < 0.5:  # 10%
                 tokens[pos] = get_random_word(self.vocab_words)
+            if self.preprocessed:
+                tokens[pos] = self.indexer(tokens[pos]) 
         # when n_pred < max_pred, we only calculate loss within n_pred
         masked_weights = [1]*len(masked_tokens)
 
         # Token Indexing
-        input_ids = self.indexer(tokens)
-        masked_ids = self.indexer(masked_tokens)
+        if self.preprocessed:
+            input_ids = tokens
+            masked_ids = masked_tokens
+        else:
+            input_ids = self.indexer(tokens)
+            masked_ids = self.indexer(masked_tokens)
 
         # Zero Padding
         n_pad = self.max_len - len(input_ids)
@@ -368,10 +576,10 @@ class Preprocess4Seq2seq(Pipeline):
         return (input_ids, segment_ids, input_mask, masked_ids, masked_pos, masked_weights, -1, self.task_idx, img, vis_masked_pos, vis_pe, ans_tk)
 
 
-class Preprocess4Seq2seqDecoder(Pipeline):
+class Preprocess4Seq2seqDecoder(Pipeline):  #to-do self.lang/ new_segment_id/ txt
     """ Pre-processing steps for pretraining transformer """
 
-    def __init__(self, vocab_words, indexer, max_len=512, max_tgt_length=128, new_segment_ids=False, mode="s2s", enable_butd=False, len_vis_input=49, region_bbox_file='', region_det_file_prefix=''):
+    def __init__(self, vocab_words, indexer, max_len=512, max_tgt_length=128, new_segment_ids=False, mode="s2s", enable_butd=False, len_vis_input=49, region_bbox_file='', region_det_file_prefix='', lang='en'):
         super().__init__()
         self.vocab_words = vocab_words  # vocabulary (sub)words
         self.indexer = indexer  # function from token to token index
@@ -381,6 +589,7 @@ class Preprocess4Seq2seqDecoder(Pipeline):
         self.new_segment_ids = new_segment_ids
         self.task_idx = 3   # relax projection layer for different tasks
         self.mode = mode
+        self.lang = lang
         if self.mode != "s2s":
             raise ValueError("Invalid mode for seq2seq decode: %s" % self.mode)
         self.max_tgt_length = max_tgt_length
@@ -411,11 +620,11 @@ class Preprocess4Seq2seqDecoder(Pipeline):
                                max_a_len + 2, self.max_len)
         tokens = padded_tokens_a
         if self.new_segment_ids:
-            segment_ids = [4]*(len(padded_tokens_a)) \
-                + [5]*(max_len_in_batch - len(padded_tokens_a))
+            segment_ids = NEW_SEGMENT_IDS['s2s_img']*(len(padded_tokens_a)) \
+                + NEW_SEGMENT_IDS['s2s_'+self.lang]*(max_len_in_batch - len(padded_tokens_a))
         else:
-            segment_ids = [0]*(len(padded_tokens_a)) \
-                + [1]*(max_len_in_batch - len(padded_tokens_a))
+            segment_ids = SEGMENT_IDS['img']*(len(padded_tokens_a)) \
+                + SEGMENT_IDS[self.lang]*(max_len_in_batch - len(padded_tokens_a))
 
         position_ids = []
         for i in range(len(tokens_a) + 2):

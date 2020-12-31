@@ -28,6 +28,7 @@ from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
 
 from vlp.loader_utils import batch_list_to_batch_tensors
 import vlp.seq2seq_loader as seq2seq_loader
+#from vlp.seq2seq_loader import Preprocess4Seq2seqBilingual
 from vlp.scst_utils import *
 from misc.data_parallel import DataParallelImbalance
 
@@ -50,10 +51,11 @@ def main():
     # Data augmentation
     parser.add_argument('--dataset', default='coco', type=str, nargs='*', help='')
     parser.add_argument('--sampling_alpha', default=0.5, type=float)
-    parser.add_argument('--sampling_beta', default=0.5, type=float)
-    parser.add_argument('--num_samples', default=, type=float)
-    parser.add_argument('--max_len_en', default=20, type=int)
-    parser.add_argument('--max_len_zh', default=20, type=int)
+    parser.add_argument('--sampling_beta', default=0.5, type=float, help='#samples per epoch=sampling_beta*total_num_samples')
+    parser.add_argument('--max_len_en', default=25, type=int, help='maximum length of English in **bilingual** corpus')
+    parser.add_argument('--max_len_zh', default=25, type=int, help='maximum length of Chinese in **bilingual** corpus')
+    parser.add_argument('--max_len_en_cap', default=25, type=int, help='maximum length of English in **img2txt** corpus')
+    parser.add_argument('--max_len_zh_cap', default=25, type=int, help='maximum length of Chinese in **img2txt** corpus')
     parser.add_argument('--len_vis_input', type=int, default=100, help="The length of visual token input")
 
     parser.add_argument("--src_file", default='$DATA_ROOT/{}/annotations/{}_dataset.json',
@@ -166,7 +168,6 @@ def main():
     parser.add_argument('--enable_tensorboard', action='store_true')
     parser.add_argument('--summary_steps', type=int, default=100)
     # parser.add_argument('--resnet_model', type=str, default='imagenet_weights/resnet101.pth')
-    parser.add_argument('--image_root', type=str, default='/mnt/dat/COCO/images')
     parser.add_argument('--split', type=str, nargs='+', default=['train', 'restval'])
 
     parser.add_argument('--world_size', default = 1, type = int,
@@ -196,20 +197,21 @@ def main():
                         help='Self-critical sequence training')
 
     args = parser.parse_args()
-    assert len(args.dataset, args.max_len_b)
     dataset = {}
-    for d, len_b in zip(args.dataset, args.max_len_b):
+    for d in args.dataset:
         assert d in ['coco','aic','wmt']
         if d == 'coco':
-            dataset[d] = {'max_len_a': args.len_vis_input, 'max_len_b': args.max_len_en}
-        if d in 'aic':
-            dataset[d] = {'max_len_a': args.len_vis_input, 'max_len_b': args.max_len_zh}
-        elif d in 'wmt':
+            dataset[d] = {'max_len_a': args.len_vis_input, 'max_len_b': args.max_len_en_cap}
+        elif d == 'aic':
+            dataset[d] = {'max_len_a': args.len_vis_input, 'max_len_b': args.max_len_zh_cap}
+        else:# d == 'wmt':
             dataset[d] = {'max_len_a': args.max_len_en, 'max_len_b': args.max_len_zh}
-        dataset['max_seq_length'] = dataset['max_len_a'] + dataset['max_len_b'] + 3
-
+        dataset[d]['max_seq_length'] = dataset[d]['max_len_a'] + dataset[d]['max_len_b'] + 3
+    args.dataset = dataset
+    print(dataset)
     print('global_rank: {}, local rank: {} Corpora: {}'.format(args.global_rank, args.local_rank, args.dataset))
-    args.max_seq_length = args.max_len_b + args.len_vis_input + 3 # +3 for 2x[SEP] and [CLS]
+    #input()
+
     args.mask_image_regions = (args.vis_mask_prob > 0) # whether to mask out image regions
     args.dist_url = args.dist_url.replace('[PT_OUTPUT_DIR]', args.output_dir)
 
@@ -289,7 +291,10 @@ def main():
     tokenizers = {'en':tokenizer_en}
 
     if 'aic' in args.dataset or 'wmt' in args.dataset:
-        tokenizer_zh = XLMTokenizer.from_pretrained(args.xml_vocab, args.xml_merge)
+        tokenizer_zh = XLMTokenizer(args.xml_vocab, args.xml_merge)
+        tokenizer_zh.tokenize = lambda x: tokenizer_zh._tokenize(x, lang='zh', bypass_tokenizer=True)
+        with open(args.xml_vocab,'r') as f:
+            tokenizer_zh.vocab = json.load(f)
         tokenizers['zh'] = tokenizer_zh
 
     indexer = Indexer([os.path.join(args.bert_model,'vocab.txt'), args.xml_vocab])
@@ -298,10 +303,11 @@ def main():
 
         for corpus in args.dataset:
             if corpus in ['coco', 'aic']:
-                tokenizer = tokenizers['en'] if corpus=='coco' else tokenizers[zh]
+                tokenizer = tokenizers['en'] if corpus=='coco' else tokenizers['zh']
                 bi_uni_pipeline = [seq2seq_loader.Preprocess4Seq2seq(args.max_pred, args.mask_prob,
-                    list(tokenizer.vocab.keys()), indexer, args.dataset[corpus]['max_seq_length'],
-                    new_segment_ids=args.new_segment_ids,  #to-do?
+                    list(tokenizer.vocab.keys()), indexer, max_len=args.dataset[corpus]['max_seq_length'],
+                    preprocessed=True,
+                    new_segment_ids=args.new_segment_ids, 
                     truncate_config={
                         'max_len_b': args.dataset[corpus]['max_len_b'], 'trunc_seg': args.trunc_seg, 'always_truncate_tail':
                         args.always_truncate_tail}, 
@@ -310,11 +316,12 @@ def main():
                     vis_mask_prob=args.vis_mask_prob, enable_butd=args.enable_butd,
                     region_bbox_file=args.region_bbox_file.format(corpus.upper(), corpus.lower()), 
                     region_det_file_prefix=args.region_det_file_prefix.format(corpus.upper(), corpus.lower()),
-                    local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2'))]
+                    local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2'), lang='zh' if corpus in ['aic'] else 'en')]
 
                 bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seq(args.max_pred, args.mask_prob,
-                    list(tokenizer.vocab.keys()), indexer, args.dataset[corpus]['max_seq_length'],
-                    new_segment_ids=args.new_segment_ids,  #to-do?
+                    list(tokenizer.vocab.keys()), indexer, max_len=args.dataset[corpus]['max_seq_length'],
+                    preprocessed=True,
+                    new_segment_ids=args.new_segment_ids,  
                     truncate_config={
                         'max_len_b': args.dataset[corpus]['max_len_b'], 'trunc_seg': args.trunc_seg, 'always_truncate_tail':
                         args.always_truncate_tail}, 
@@ -323,21 +330,54 @@ def main():
                     vis_mask_prob=args.vis_mask_prob, enable_butd=args.enable_butd,
                     region_bbox_file=args.region_bbox_file.format(corpus.upper(), corpus.lower()), 
                     region_det_file_prefix=args.region_det_file_prefix.format(corpus.upper(), corpus.lower()),
-                    local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2')))
+                    local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2'), lang='zh' if corpus in ['aic'] else 'en'))
 
+                split = args.split #'['train']
+                if corpus=='coco' and split=='train':
+                    split.append('restval')
                 args.dataset[corpus]['train_dataset'] = seq2seq_loader.Img2txtDataset(
                     args.src_file.format(corpus.upper(), corpus.lower()), 
                     args.image_root.format(corpus.upper()), 
-                    args.split, args.train_batch_size,
+                    split, args.train_batch_size,
                     tokenizer, 
                     args.dataset[corpus]['max_seq_length'], 
+                    preprocessed=True,
                     file_valid_jpgs=args.file_valid_jpgs.format(corpus.upper(), corpus.lower()),
                     bi_uni_pipeline=bi_uni_pipeline, use_num_imgs=args.use_num_imgs,
                     s2s_prob=args.s2s_prob, bi_prob=args.bi_prob,
                     enable_butd=args.enable_butd, tasks=args.tasks)
 
             elif corpus == 'wmt':
-                args.dataset[corpus]['train_dataset'] = seq2seq_loader.Txt2txtDataset()   #to-do
+                #print(seq2seq_loader.__dict__)
+                print(seq2seq_loader.Preprocess4Seq2seqBilingual)
+                bi_uni_pipeline = [seq2seq_loader.Preprocess4Seq2seqBilingual(
+                    args.max_pred, args.mask_prob, 
+                    list(indexer.vocab.keys()), indexer, args.dataset[corpus]['max_seq_length'],
+                    preprocessed=True,
+                    new_segment_ids=args.new_segment_ids, 
+                    truncate_config={
+                        'max_len_a': args.dataset[corpus]['max_len_a'],
+                        'max_len_b': args.dataset[corpus]['max_len_b'], 
+                        'trunc_seg': None, 'always_truncate_tail':args.always_truncate_tail}, 
+                    mode='s2s', local_rank=args.local_rank)]
+                bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seqBilingual(
+                        args.max_pred, args.mask_prob, 
+                        list(indexer.vocab.keys()), indexer, args.dataset[corpus]['max_seq_length'],
+                        preprocessed=True,
+                        new_segment_ids=args.new_segment_ids, 
+                        truncate_config={
+                            'max_len_a': args.dataset[corpus]['max_len_a'],
+                            'max_len_b': args.dataset[corpus]['max_len_b'], 
+                            'trunc_seg': None, 'always_truncate_tail':args.always_truncate_tail}, 
+                        mode='bi', local_rank=args.local_rank)
+                    )
+                args.dataset[corpus]['train_dataset'] = seq2seq_loader.Txt2txtDataset(
+                    args.src_file.format(corpus.upper(), corpus.lower()),
+                    args.split, args.train_batch_size,
+                    tokenizers, args.dataset[corpus]['max_seq_length'], 
+                    preprocessed=True,
+                    bi_uni_pipeline=bi_uni_pipeline,s2s_prob=args.s2s_prob, bi_prob=args.bi_prob)  
+        
 
         train_dataset = seq2seq_loader.CombinedDataset(
                     datasets_dict={c: args.dataset[c]['train_dataset'] for c in args.dataset})
@@ -352,10 +392,12 @@ def main():
                 num_samples.append(N)
                 total_num_samples += N
             logger.info('total number samples {}'.format(total_num_samples))
+
             trainer_batch_sampler = WeightedRandom_BatchSampler(
                 num_samples, args.train_batch_size,
-                args.sampling_alpha, num_batch=int(total_num_samples*args.sampling_beta/args.train_batch_size),
+                args.sampling_alpha, num_batch=math.ceiling(total_num_samples*args.sampling_alpha/args.train_batch_size),
                 drop_last=False)
+            #num_batch the total number of batch per epoch
         else:
             train_sampler = DistributedSampler(train_dataset)
 

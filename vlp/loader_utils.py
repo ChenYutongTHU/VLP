@@ -14,14 +14,16 @@ def get_random_word(vocab_words):
     return vocab_words[i]
 
 
-def batch_list_to_batch_tensors(batch):
+def batch_list_to_batch_tensors(batch):  #[(info, (...)), (info, (...))]
     batch_tensors = []
-    for x in zip(*batch):
+    info_batch = [d[0] for d in batch]
+    data_batch = [d[1] for d in batch]
+    for x in zip(*data_batch):
         if isinstance(x[0], torch.Tensor):
             batch_tensors.append(torch.stack(x))
         else:
             batch_tensors.append(torch.tensor(x, dtype=torch.long))
-    return batch_tensors
+    return info_batch, batch_tensors
 
 
 class Pipeline():

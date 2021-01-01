@@ -193,8 +193,8 @@ class Img2txtDataset(torch.utils.data.Dataset):
                                             counter += 1
                                         except:
                                             pass
-                    json.dump(valid_img, open(file_valid_jpgs, 'w'))
-                    print('Saving {0} valid JPG IDs'.format(len(valid_img)))
+                    #json.dump(valid_img, open(file_valid_jpgs, 'w'))
+                    #print('Saving {0} valid JPG IDs'.format(len(valid_img)))
                 else:
                     valid_jpgs = set(json.load(open(file_valid_jpgs)))
                     print('Loading {0} valid JPG IDs!'.format(len(valid_jpgs)))
@@ -257,10 +257,11 @@ class Img2txtDataset(torch.utils.data.Dataset):
             yield batch_list_to_batch_tensors(batch)
 
 class Preprocess4Seq2seqBilingual(Pipeline):
-    def __init__(self, file_src, max_pred, mask_prob, vocab_words, tokenizers, indexer, max_len, split, preprocessed=True,
+    def __init__(self, corpus, file_src, max_pred, mask_prob, vocab_words, tokenizers, indexer, max_len, split, preprocessed=True,
         new_segment_ids=False, truncate_config={}, mode="s2s", local_rank=-1):
         super().__init__()
         #default a-en b-zh
+        self.corpus = corpus
         self.file_src = file_src
         self.max_pred = max_pred  # max tokens of prediction
         self.mask_prob = mask_prob  # masking probability
@@ -398,13 +399,14 @@ class Preprocess4Seq2seqBilingual(Pipeline):
             masked_pos.extend([0] * n_pad)
             masked_weights.extend([0] * n_pad)
 
-        return (input_ids, segment_ids, input_mask, masked_ids, masked_pos, masked_weights, -1, self.task_idx)#, img, vis_masked_pos, vis_pe, ans_tk)
+        return (self.corpus,self.mode), (input_ids, segment_ids, input_mask, masked_ids, masked_pos, masked_weights, -1, self.task_idx)#, img, vis_masked_pos, vis_pe, ans_tk)
 
 class Preprocess4Seq2seq(Pipeline):
     """ Pre-processing steps for pretraining transformer """
 
-    def __init__(self, max_pred, mask_prob, vocab_words, indexer, preprocessed=True, max_len=512, block_mask=False, new_segment_ids=False, truncate_config={}, mask_image_regions=False, mode="s2s", len_vis_input=49, vis_mask_prob=0.25, enable_butd=False, region_bbox_file='', region_det_file_prefix='', local_rank=-1, load_vqa_ann=False, lang='en'):
+    def __init__(self, corpus, max_pred, mask_prob, vocab_words, indexer, preprocessed=True, max_len=512, block_mask=False, new_segment_ids=False, truncate_config={}, mask_image_regions=False, mode="s2s", len_vis_input=49, vis_mask_prob=0.25, enable_butd=False, region_bbox_file='', region_det_file_prefix='', local_rank=-1, load_vqa_ann=False, lang='en'):
         super().__init__()
+        self.corpus = corpus
         self.max_pred = max_pred  # max tokens of prediction
         self.mask_prob = mask_prob  # masking probability
         self.vocab_words = vocab_words  # vocabulary (sub)words
@@ -597,7 +599,7 @@ class Preprocess4Seq2seq(Pipeline):
             else:
                 ans_tk = img.new(1)
 
-        return (input_ids, segment_ids, input_mask, masked_ids, masked_pos, masked_weights, -1, self.task_idx, img, vis_masked_pos, vis_pe, ans_tk)
+        return (self.corpus, self.mode),(input_ids, segment_ids, input_mask, masked_ids, masked_pos, masked_weights, -1, self.task_idx, img, vis_masked_pos, vis_pe, ans_tk)
 
 
 class Preprocess4Seq2seqDecoder(Pipeline):  #to-do self.lang/ new_segment_id/ txt
@@ -732,6 +734,62 @@ class CombinedDataset(torch.utils.data.Dataset):
         raise
         return None
 
+class WeightedRandom_DistributedBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, corpus_size, batch_size, alpha, num_batches, drop_last=False, num_replicas=None, rank=None, seed=0):
+        #note that here 
+        #batch_size -> batch_size_per_gpu
+        #num_batches -> num_batches_per_gpu
+        self.drop_last=drop_last
+        self.alpha = alpha
+        self.corpus_size = corpus_size
+
+        if num_replicas is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = torch.distributed.get_world_size()
+        if rank is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = torch.distributed.get_rank()
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.batch_size = batch_size*self.num_replicas #batch_size -> batch_size per GPU
+        self.num_batches = num_batches # num_batches_per_gpu
+        self.epoch = 0
+        self.seed = seed
+
+    def __iter__(self):
+        all_batches = []
+        cnt = 0
+        weights = []
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        for cs in self.corpus_size:
+            shuffled_indices =(torch.randperm(cs, generator=g)+cnt).tolist()
+            i = 0
+            while i<cs:
+                if i+self.batch_size>cs:
+                    if self.drop_last:
+                        break
+                    else:
+                        all_batches.append(shuffled_indices[i:]+shuffled_indices[0:self.batch_size-(cs-i)])
+                        weights.append(math.pow(cs, self.alpha-1))      
+                else:
+                    all_batches.append(shuffled_indices[i:i+self.batch_size])
+                    weights.append(math.pow(cs, self.alpha-1))  
+                i += self.batch_size
+            cnt += cs                                                        
+        batch_indices = torch.multinomial(torch.tensor(weights,dtype=torch.float32), self.num_batches, 
+            generator=g, replacement=False)
+
+        for ind in batch_indices:
+            yield all_batches[ind][self.rank::self.num_replicas]
+        #subsample
+
+    def __len__(self):
+        return self.num_batches
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
 class WeightedRandom_BatchSampler(torch.utils.data.Sampler):
     def __init__(self, corpus_size, batch_size, alpha, num_batches, drop_last=False):
@@ -753,7 +811,7 @@ class WeightedRandom_BatchSampler(torch.utils.data.Sampler):
                         break
                     else:
                         all_batches.append(shuffled_indices[i:]+shuffled_indices[0:self.batch_size-(cs-i)])
-                        weights.append(math.pow(cs, self.alpha))
+                        weights.append(math.pow(cs, self.alpha-1))
                 else:
                     all_batches.append(shuffled_indices[i:i+self.batch_size])
                     weights.append(math.pow(cs, self.alpha-1))

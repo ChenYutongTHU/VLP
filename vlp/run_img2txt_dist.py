@@ -208,7 +208,6 @@ def main():
             dataset[d] = {'max_len_a': args.max_len_en, 'max_len_b': args.max_len_zh}
         dataset[d]['max_seq_length'] = dataset[d]['max_len_a'] + dataset[d]['max_len_b'] + 3
     args.dataset = dataset
-    print(dataset)
     print('global_rank: {}, local rank: {} Corpora: {}'.format(args.global_rank, args.local_rank, args.dataset))
     #input()
 
@@ -242,6 +241,7 @@ def main():
         datefmt='%m/%d/%Y %H:%M:%S',
         level=logging.INFO)
     logger = logging.getLogger(__name__)
+    logger.info(dataset)
 
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device(
@@ -302,9 +302,11 @@ def main():
     if args.do_train:
 
         for corpus in args.dataset:
+            print('\nCorpus {}'.format(corpus))
             if corpus in ['coco', 'aic']:
                 tokenizer = tokenizers['en'] if corpus=='coco' else tokenizers['zh']
-                bi_uni_pipeline = [seq2seq_loader.Preprocess4Seq2seq(args.max_pred, args.mask_prob,
+                bi_uni_pipeline = [seq2seq_loader.Preprocess4Seq2seq(
+                    corpus, args.max_pred, args.mask_prob,
                     list(tokenizer.vocab.keys()), indexer, max_len=args.dataset[corpus]['max_seq_length'],
                     preprocessed=True,
                     new_segment_ids=args.new_segment_ids, 
@@ -318,7 +320,8 @@ def main():
                     region_det_file_prefix=args.region_det_file_prefix.format(corpus.upper(), corpus.lower()),
                     local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2'), lang='zh' if corpus in ['aic'] else 'en')]
 
-                bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seq(args.max_pred, args.mask_prob,
+                bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seq(
+                    corpus, args.max_pred, args.mask_prob,
                     list(tokenizer.vocab.keys()), indexer, max_len=args.dataset[corpus]['max_seq_length'],
                     preprocessed=True,
                     new_segment_ids=args.new_segment_ids,  
@@ -349,8 +352,8 @@ def main():
 
             elif corpus == 'wmt':
                 #print(seq2seq_loader.__dict__)
-                print(seq2seq_loader.Preprocess4Seq2seqBilingual)
                 bi_uni_pipeline = [seq2seq_loader.Preprocess4Seq2seqBilingual(
+                    'wmt',
                     args.src_file.format(corpus.upper(), corpus.lower()),
                     args.max_pred, args.mask_prob, 
                     list(indexer.vocab.keys()),  tokenizers, 
@@ -364,6 +367,7 @@ def main():
                         'trunc_seg': None, 'always_truncate_tail':args.always_truncate_tail}, 
                     mode='s2s', local_rank=args.local_rank)]
                 bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seqBilingual(
+                        'wmt',
                         args.src_file.format(corpus.upper(), corpus.lower()),
                         args.max_pred, args.mask_prob, 
                         list(indexer.vocab.keys()), tokenizers, 
@@ -387,32 +391,38 @@ def main():
 
         train_dataset = seq2seq_loader.CombinedDataset(
                     datasets_dict={c: args.dataset[c]['train_dataset'] for c in args.dataset})
+        #train_sampler = RandomSampler(train_dataset, replacement=False)
+        logger.info('************Data statistics******************')
+        num_samples = []
+        total_num_samples = 0
+        for corpus in args.dataset:
+            N = len(args.dataset[corpus]['train_dataset'])
+            logger.info('{} #{}'.format(corpus, N))
+            num_samples.append(N)
+            total_num_samples += N
+        logger.info('total number samples {}'.format(total_num_samples))
+        logger.info('number samples per epoch {}'.format(total_num_samples*args.sampling_beta))
         if args.local_rank == -1:
-            #train_sampler = RandomSampler(train_dataset, replacement=False)
-            logger.info('************Data statistics******************')
-            num_samples = []
-            total_num_samples = 0
-            for corpus in args.dataset:
-                N = len(args.dataset[corpus]['train_dataset'])
-                logger.info('{} #{}'.format(corpus, N))
-                num_samples.append(N)
-                total_num_samples += N
-            logger.info('total number samples {}'.format(total_num_samples))
-            logger.info('number samples per epoch {}'.format(total_num_samples*args.sampling_beta))
-            # train_batch_sampler = seq2seq_loader.WeightedRandom_BatchSampler(
-            #     num_samples, args.train_batch_size,
-            #     args.sampling_alpha, num_batches=math.ceil(total_num_samples*args.sampling_alpha/args.train_batch_size),
-            #     drop_last=False) #to-check
-            # train_dataloader = torch.utils.data.DataLoader(train_dataset,
-            #     batch_sampler=train_batch_sampler, num_workers=args.num_workers,
+            train_batch_sampler = seq2seq_loader.WeightedRandom_BatchSampler(
+                num_samples, args.train_batch_size,
+                args.sampling_alpha, num_batches=math.ceil(total_num_samples*args.sampling_beta
+                    /args.train_batch_size),
+                drop_last=False) #to-check
+            # train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size,
+            #     sampler=SequentialSampler(train_dataset), num_workers=args.num_workers, 
             #     collate_fn=batch_list_to_batch_tensors, pin_memory=True)
-            #     train_batch_sampler = SequentialSampler(train_dataset)
-            train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size,
-                sampler=SequentialSampler(train_dataset), num_workers=args.num_workers, 
-                collate_fn=batch_list_to_batch_tensors, pin_memory=True)
             #num_batch the total number of batch per epoch
         else:
-            train_sampler = DistributedSampler(train_dataset)
+            num_batches = math.ceil(total_num_samples*args.sampling_beta/torch.distributed.get_world_size()/args.train_batch_size)
+            train_batch_sampler = seq2seq_loader.WeightedRandom_DistributedBatchSampler(
+                num_samples, args.train_batch_size, 
+                args.sampling_alpha, num_batches=num_batches,
+                drop_last=False)
+
+        train_dataloader = torch.utils.data.DataLoader(train_dataset,
+            batch_sampler=train_batch_sampler, num_workers=args.num_workers,
+            collate_fn=batch_list_to_batch_tensors, pin_memory=True)
+
 
 
 #batch_sampler batch_sampler (Sampler or Iterable, optional) 
@@ -575,38 +585,46 @@ def main():
             start_epoch = 1
         for i_epoch in trange(start_epoch, args.num_train_epochs+1, desc="Epoch"):
             if args.local_rank >= 0:
-                train_sampler.set_epoch(i_epoch-1)
+                train_batch_sampler.set_epoch(i_epoch-1)
             iter_bar = tqdm(train_dataloader, desc='Iter (loss=X.XXX)')
             nbatches = len(train_dataloader)
             train_loss = []
             pretext_loss = []
             vqa2_loss = []
             scst_reward = []
-            for step, batch in enumerate(iter_bar):
+            for step, iter_output in enumerate(iter_bar):
+                info_, batch = iter_output[0], iter_output[1]
+                logger.info('rank {}, step {}'.format(torch.distributed.get_rank(), step))
+                logger.info(info_)
+                #input()
+                continue
                 batch = [t.to(device) for t in batch]
-                #input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx, img, vis_masked_pos, vis_pe, ans_labels = batch
-                input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx = batch
-                print('input_Ids \n')
-                print(input_ids.shape)
-                print(input_ids[0])
-                input()
-                print('segment_ids \n')
-                print(segment_ids.shape)
-                print(segment_ids[0])
-                input()
-                print('input_mask \n')
-                print(input_mask.shape)
-                torch.set_printoptions(profile='full')
-                print(input_mask[0,:60])
-                input()
-                print('lm label ids \n')
-                print(lm_label_ids.shape)
-                print(lm_label_ids[0])
-                input()
-                print('masked pos \n')
-                print(masked_pos.shape)
-                print(masked_pos[0])
-                input()
+
+                if info_[0][0] in ['coco','aic']:
+                    input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx, img, vis_masked_pos, vis_pe, ans_labels = batch
+                elif info[0][0] in ['wmt']:
+                    input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx = batch
+                # print('input_Ids \n')
+                # print(input_ids.shape)
+                # print(input_ids[0])
+                # input()
+                # print('segment_ids \n')
+                # print(segment_ids.shape)
+                # print(segment_ids[0])
+                # input()
+                # print('input_mask \n')
+                # print(input_mask.shape)
+                # torch.set_printoptions(profile='full')
+                # print(input_mask[0,:60])
+                # input()
+                # print('lm label ids \n')
+                # print(lm_label_ids.shape)
+                # print(lm_label_ids[0])
+                # input()
+                # print('masked pos \n')
+                # print(masked_pos.shape)
+                # print(masked_pos[0])
+                # input()
                 # if args.fp16:
                 #     img = img.half()
                 #     vis_pe = vis_pe.half()

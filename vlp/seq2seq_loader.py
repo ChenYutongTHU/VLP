@@ -22,12 +22,12 @@ import h5py
 import tqdm, time
 
 NEW_SEGMENT_IDS = {
-    'bi_img':0, 'bi_en_cap':1, 'bi_zh_cap':6,
-    's2s_img':4, 's2s_en_cap':5, 's2s_zh_cap':7,
-    'bi_en':8, 'bi_zh':9,
-    's2s_en':10,'s2s_zh':11}
+    'bi_img':[0], 'bi_en_cap':[1], 'bi_zh_cap':[6],
+    's2s_img':[4], 's2s_en_cap':[5], 's2s_zh_cap':[7],
+    'bi_en':[8], 'bi_zh':[9],
+    's2s_en':[10],'s2s_zh':[11]}
 SEGMENT_IDS = {
-    'img':0, 'en':1, 'zh':6}
+    'img':[0], 'en':[1], 'zh':[6]}
 
 def truncate_tokens_pair(tokens_a, tokens_b, max_len, max_len_a=0, max_len_b=0, trunc_seg=None, always_truncate_tail=False):
     num_truncated_a = [0, 0]
@@ -67,7 +67,7 @@ def truncate_tokens_pair(tokens_a, tokens_b, max_len, max_len_a=0, max_len_b=0, 
     return num_truncated_a, num_truncated_b
 
 class Txt2txtDataset(torch.utils.data.Dataset): #to-do
-    def __init__(self, file_src, split, batch_size, tokenizers, max_len, preprocessed=True,
+    def __init__(self, N_lines, split, batch_size, tokenizers, max_len, preprocessed=True,
         short_sampling_prob=0.1, sent_reverse_order=False, bi_uni_pipeline=[], s2s_prob=1, bi_prob=0):
         super().__init__()
         self.tokenizers = tokenizers #{'zh': ,'en'}
@@ -81,7 +81,9 @@ class Txt2txtDataset(torch.utils.data.Dataset): #to-do
         self.preprocessed = preprocessed
         print('Txt2txt Sample seq2seq {} and bidirectional {}'.format(self.s2s_prob, self.bi_prob))
         assert(self.s2s_prob + self.bi_prob == 1)
+        self.N_lines = N_lines
 
+        ''' # too slow
         if preprocessed:
             file_src = file_src.split('.')[0]+'_preprocessed.json'#'wmt_dataset.json' -> 'wmt_pretokenized'
             print('Loading preprocessed {}'.format(file_src))
@@ -110,20 +112,21 @@ class Txt2txtDataset(torch.utils.data.Dataset): #to-do
                 en_t = self.tokenizers['en'].tokenize(en)
                 zh_t = self.tokenizers['zh'].tokenize(zh)
                 self.ex_list.append([en_t, zh_t])
+        '''
+
 
     def __len__(self):
-        return len(self.ex_list)
+        return self.N_lines
 
     def __getitem__(self, idx):
-        instance = self.ex_list[idx]  #en_t, zh_t
         proc = choices(self.bi_uni_pipeline, weights=[self.s2s_prob, self.bi_prob])[0]
-        instance = proc(instance)
+        instance = proc(idx)
         return instance
     def __iter__(self):  # iterator to load data
-        for __ in range(math.ceil(len(self.ex_list) / float(self.batch_size))):
+        for __ in range(math.ceil(self.N_lines / float(self.batch_size))):
             batch = []
             for __ in range(self.batch_size):
-                idx = randint(0, len(self.ex_list)-1)
+                idx = randint(0, self.N_lines-1)
                 batch.append(self.__getitem__(idx))
             # To Tensor
             yield batch_list_to_batch_tensors(batch)
@@ -158,6 +161,7 @@ class Img2txtDataset(torch.utils.data.Dataset):
 
                 if not os.path.isfile(file_valid_jpgs):
                     valid_img = {}
+                    ii= 0
                     for src in img_dat:
                         if src['split'] in split:
                             if use_num_imgs == -1 or counter < use_num_imgs:
@@ -253,13 +257,15 @@ class Img2txtDataset(torch.utils.data.Dataset):
             yield batch_list_to_batch_tensors(batch)
 
 class Preprocess4Seq2seqBilingual(Pipeline):
-    def __init__(self, max_pred, mask_prob, vocab_words, indexer, max_len, preprocessed=True,
+    def __init__(self, file_src, max_pred, mask_prob, vocab_words, tokenizers, indexer, max_len, split, preprocessed=True,
         new_segment_ids=False, truncate_config={}, mode="s2s", local_rank=-1):
         super().__init__()
         #default a-en b-zh
+        self.file_src = file_src
         self.max_pred = max_pred  # max tokens of prediction
         self.mask_prob = mask_prob  # masking probability
         self.vocab_words = vocab_words  # vocabulary (sub)words
+        self.tokenizers = tokenizers
         self.indexer = indexer  # function from token to token index 
         self._tril_matrix = torch.tril(torch.ones(
             (max_len, max_len), dtype=torch.long))
@@ -268,8 +274,11 @@ class Preprocess4Seq2seqBilingual(Pipeline):
             'always_truncate_tail', False)   
         self.max_len_a = truncate_config.get('max_len_a', None)  #
         self.max_len_b = truncate_config.get('max_len_b', None)
+        self.max_len = max_len
         self.trunc_seg = None  # truncate the longer segment   
         self.preprocessed = preprocessed
+        assert len(split)==1, split
+        self.split = split[0]
 
         assert mode in ("s2s", "bi")
         self.mode = mode  
@@ -278,10 +287,20 @@ class Preprocess4Seq2seqBilingual(Pipeline):
         elif mode == 'bi':
             self.task_idx = 0
 
-    def __call__(self, instance):
-        tokens_a, tokens_b = instance[:2] #[CLS] [SEP] [SEP] unincluded #en zh
+    def __call__(self, idx):
+        assert self.preprocessed, 'Only support preprocessed h5py now'
+        if self.preprocessed:
+            self.file_src_en = os.path.join(os.path.dirname(self.file_src),'corpus_en_preprocessed.hdf5')
+            self.file_src_zh = os.path.join(os.path.dirname(self.file_src),'corpus_zh_preprocessed.hdf5')
+            with h5py.File(self.file_src_en,'r')  as en_f, \
+                h5py.File(self.file_src_zh,'r') as zh_f:
+                tokens_a = list(en_f[self.split][idx])
+                tokens_b = list(zh_f[self.split][idx])
 
-        truncate_tokens_pair(tokens_en, tokens_zh,
+
+        #tokens_a, tokens_b = instance[:2] #[CLS] [SEP] [SEP] unincluded #en zh
+        #print(tokens_a, tokens_b)
+        truncate_tokens_pair(tokens_a, tokens_b,
             self.max_len_a+self.max_len_b, max_len_a=self.max_len_a, max_len_b=self.max_len_b,
             trunc_seg=self.trunc_seg, always_truncate_tail=self.always_truncate_tail)
         if self.preprocessed:
@@ -328,14 +347,16 @@ class Preprocess4Seq2seqBilingual(Pipeline):
         for pos in masked_pos:
             if rand() < 0.8:  # 80%
                 tokens[pos] =  '[MASK]' 
+                if self.preprocessed:
+                    tokens[pos] = self.indexer(tokens[pos])
             elif rand() < 0.5:  # 10%
                 if mask_type=='a':
                     tokens[pos] = get_random_word(list(self.tokenizers['en'].vocab.keys()))
                 else:
                     tokens[pos] = get_random_word(list(self.tokenizers['zh'].vocab.keys()))
+                if self.preprocessed:
+                    tokens[pos] = self.indexer(tokens[pos])
 
-            if self.preprocessed:
-                tokens[pos] = self.indexer(tokens[pos])
 
         masked_weights = [1]*len(masked_tokens)
 
@@ -344,8 +365,8 @@ class Preprocess4Seq2seqBilingual(Pipeline):
             input_ids = self.indexer(tokens)
             masked_ids = self.indexer(masked_tokens)
         else:
-            input_ids = tokens
-            masked_ids = masked_tokens
+            input_ids = tokens[:]
+            masked_ids = masked_tokens[:]
 
         # Zero Padding
         n_pad = self.max_len - len(input_ids)
@@ -448,11 +469,12 @@ class Preprocess4Seq2seq(Pipeline):
         else:
             tokens = ['[CLS]'] + tokens_a + ['[SEP]'] + tokens_b + ['[SEP]']
 
+
         if self.new_segment_ids:
             if self.mode == 's2s':
-                segment_ids = NEW_SEGMENT_IDS['s2s_img'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['s2s_'+self.lang] * (len(tokens_b)+1)
+                segment_ids = NEW_SEGMENT_IDS['s2s_img'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['s2s_'+self.lang+'_cap'] * (len(tokens_b)+1)
             elif self.mode == 'bi':
-                segment_ids = NEW_SEGMENT_IDS['bi_img'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['bi_'+self.lang] * (len(tokens_b)+1)
+                segment_ids = NEW_SEGMENT_IDS['bi_img'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['bi_'+self.lang+'_cap'] * (len(tokens_b)+1)
         else:
             segment_ids = SEGMENT_IDS['img'] * (len(tokens_a)+2) + SEGMENT_IDS[self.lang] * (len(tokens_b)+1)
 
@@ -485,17 +507,19 @@ class Preprocess4Seq2seq(Pipeline):
         for pos in masked_pos:
             if rand() < 0.8:  # 80%
                 tokens[pos] = '[MASK]'
+                if self.preprocessed:
+                    tokens[pos] = self.indexer(tokens[pos]) 
             elif rand() < 0.5:  # 10%
                 tokens[pos] = get_random_word(self.vocab_words)
-            if self.preprocessed:
-                tokens[pos] = self.indexer(tokens[pos]) 
+                if self.preprocessed:
+                    tokens[pos] = self.indexer(tokens[pos]) 
         # when n_pred < max_pred, we only calculate loss within n_pred
         masked_weights = [1]*len(masked_tokens)
 
         # Token Indexing
         if self.preprocessed:
-            input_ids = tokens
-            masked_ids = masked_tokens
+            input_ids = tokens[:]
+            masked_ids = masked_tokens[:]
         else:
             input_ids = self.indexer(tokens)
             masked_ids = self.indexer(masked_tokens)
@@ -694,12 +718,20 @@ class CombinedDataset(torch.utils.data.Dataset):
         super().__init__() #sample strategy using a ratio
         self.datasets_dict = datasets_dict
         self.datasets = [self.datasets_dict[key] for key in self.datasets_dict]
+        self.lens = [len(d) for d in self.datasets]
+        print('Length of Combined Dataset {} sum:{}'.format(self.lens, sum(self.lens)))
 
     def __len__(self):
-        pass
-    def __getitem__(self): #to-do
-        #sample strategy 
-        pass 
+        return sum([len(d) for d in self.datasets])
+    def __getitem__(self, idx):
+        clen = 0
+        for i, length in enumerate(self.lens):
+            if idx>=clen and idx<clen+length:
+                return self.datasets[i][idx-clen]
+            clen += length
+        raise
+        return None
+
 
 class WeightedRandom_BatchSampler(torch.utils.data.Sampler):
     def __init__(self, corpus_size, batch_size, alpha, num_batches, drop_last=False):
@@ -724,7 +756,7 @@ class WeightedRandom_BatchSampler(torch.utils.data.Sampler):
                         weights.append(math.pow(cs, self.alpha))
                 else:
                     all_batches.append(shuffled_indices[i:i+self.batch_size])
-                    weights.append(math.pow(cs, self.alpha))
+                    weights.append(math.pow(cs, self.alpha-1))
 
                 i += self.batch_size
             cnt += cs

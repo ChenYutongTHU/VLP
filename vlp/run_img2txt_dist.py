@@ -16,7 +16,7 @@ from tqdm import tqdm, trange
 from pathlib import Path
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 import random, math
 import copy
@@ -57,6 +57,7 @@ def main():
     parser.add_argument('--max_len_en_cap', default=25, type=int, help='maximum length of English in **img2txt** corpus')
     parser.add_argument('--max_len_zh_cap', default=25, type=int, help='maximum length of Chinese in **img2txt** corpus')
     parser.add_argument('--len_vis_input', type=int, default=100, help="The length of visual token input")
+    parser.add_argument('--wmt_N_lines', type=int, default=24752392, help='The total number of wmt lines')
 
     parser.add_argument("--src_file", default='$DATA_ROOT/{}/annotations/{}_dataset.json',
                         type=str, help="The input data file name.")
@@ -73,8 +74,7 @@ def main():
     parser.add_argument("--config_path", default=None, type=str,
                         help="Bert config file path.")
     parser.add_argument("--output_dir",
-                        default='tmp',
-                        type=str,
+                        default='tmp',type=str,
                         help="The output directory where the model predictions and checkpoints will be written.")
     parser.add_argument("--log_file",
                         default="training.log",
@@ -333,8 +333,8 @@ def main():
                     local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2'), lang='zh' if corpus in ['aic'] else 'en'))
 
                 split = args.split #'['train']
-                if corpus=='coco' and split=='train':
-                    split.append('restval')
+                if corpus=='coco' and split[0]=='train':
+                    split = split+['restval']
                 args.dataset[corpus]['train_dataset'] = seq2seq_loader.Img2txtDataset(
                     args.src_file.format(corpus.upper(), corpus.lower()), 
                     args.image_root.format(corpus.upper()), 
@@ -351,8 +351,11 @@ def main():
                 #print(seq2seq_loader.__dict__)
                 print(seq2seq_loader.Preprocess4Seq2seqBilingual)
                 bi_uni_pipeline = [seq2seq_loader.Preprocess4Seq2seqBilingual(
+                    args.src_file.format(corpus.upper(), corpus.lower()),
                     args.max_pred, args.mask_prob, 
-                    list(indexer.vocab.keys()), indexer, args.dataset[corpus]['max_seq_length'],
+                    list(indexer.vocab.keys()),  tokenizers, 
+                    indexer, args.dataset[corpus]['max_seq_length'],
+                    split=args.split,
                     preprocessed=True,
                     new_segment_ids=args.new_segment_ids, 
                     truncate_config={
@@ -361,8 +364,11 @@ def main():
                         'trunc_seg': None, 'always_truncate_tail':args.always_truncate_tail}, 
                     mode='s2s', local_rank=args.local_rank)]
                 bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seqBilingual(
+                        args.src_file.format(corpus.upper(), corpus.lower()),
                         args.max_pred, args.mask_prob, 
-                        list(indexer.vocab.keys()), indexer, args.dataset[corpus]['max_seq_length'],
+                        list(indexer.vocab.keys()), tokenizers, 
+                        indexer, args.dataset[corpus]['max_seq_length'],
+                        split=args.split,
                         preprocessed=True,
                         new_segment_ids=args.new_segment_ids, 
                         truncate_config={
@@ -372,7 +378,7 @@ def main():
                         mode='bi', local_rank=args.local_rank)
                     )
                 args.dataset[corpus]['train_dataset'] = seq2seq_loader.Txt2txtDataset(
-                    args.src_file.format(corpus.upper(), corpus.lower()),
+                    args.wmt_N_lines,
                     args.split, args.train_batch_size,
                     tokenizers, args.dataset[corpus]['max_seq_length'], 
                     preprocessed=True,
@@ -392,22 +398,30 @@ def main():
                 num_samples.append(N)
                 total_num_samples += N
             logger.info('total number samples {}'.format(total_num_samples))
-
-            trainer_batch_sampler = WeightedRandom_BatchSampler(
-                num_samples, args.train_batch_size,
-                args.sampling_alpha, num_batch=math.ceiling(total_num_samples*args.sampling_alpha/args.train_batch_size),
-                drop_last=False)
+            logger.info('number samples per epoch {}'.format(total_num_samples*args.sampling_beta))
+            # train_batch_sampler = seq2seq_loader.WeightedRandom_BatchSampler(
+            #     num_samples, args.train_batch_size,
+            #     args.sampling_alpha, num_batches=math.ceil(total_num_samples*args.sampling_alpha/args.train_batch_size),
+            #     drop_last=False) #to-check
+            # train_dataloader = torch.utils.data.DataLoader(train_dataset,
+            #     batch_sampler=train_batch_sampler, num_workers=args.num_workers,
+            #     collate_fn=batch_list_to_batch_tensors, pin_memory=True)
+            #     train_batch_sampler = SequentialSampler(train_dataset)
+            train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size,
+                sampler=SequentialSampler(train_dataset), num_workers=args.num_workers, 
+                collate_fn=batch_list_to_batch_tensors, pin_memory=True)
             #num_batch the total number of batch per epoch
         else:
             train_sampler = DistributedSampler(train_dataset)
 
-        train_dataloader = torch.utils.data.DataLoader(train_dataset,
-            batch_sampler=train_batch_sampler, num_workers=args.num_workers,
-            collate_fn=batch_list_to_batch_tensors, pin_memory=True)
+
+#batch_sampler batch_sampler (Sampler or Iterable, optional) 
+#– like sampler, but returns a batch of indices at a time. 
+#Mutually exclusive with batch_size, shuffle, sampler, and drop_last.
 
     # note: args.train_batch_size has been changed to (/= args.gradient_accumulation_steps)
     t_total = int(len(train_dataloader) * args.num_train_epochs * 1. /
-                  args.gradient_accumulation_steps)
+                  args.gradient_accumulation_steps) # number of backward steps
 
     amp_handle = None
     if  args.amp:
@@ -570,8 +584,29 @@ def main():
             scst_reward = []
             for step, batch in enumerate(iter_bar):
                 batch = [t.to(device) for t in batch]
-                input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx, img, vis_masked_pos, vis_pe, ans_labels = batch
-
+                #input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx, img, vis_masked_pos, vis_pe, ans_labels = batch
+                input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx = batch
+                print('input_Ids \n')
+                print(input_ids.shape)
+                print(input_ids[0])
+                input()
+                print('segment_ids \n')
+                print(segment_ids.shape)
+                print(segment_ids[0])
+                input()
+                print('input_mask \n')
+                print(input_mask.shape)
+                torch.set_printoptions(profile='full')
+                print(input_mask[0,:60])
+                input()
+                print('lm label ids \n')
+                print(lm_label_ids.shape)
+                print(lm_label_ids[0])
+                input()
+                print('masked pos \n')
+                print(masked_pos.shape)
+                print(masked_pos[0])
+                input()
                 # if args.fp16:
                 #     img = img.half()
                 #     vis_pe = vis_pe.half()

@@ -214,7 +214,7 @@ class BertEmbeddings(nn.Module):
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-5)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, vis_feats, vis_pe, input_ids, token_type_ids=None, position_ids=None, vis_input=True, len_vis_input=49):
+    def forward(self, vis_feats=None, vis_pe=None, input_ids=None, token_type_ids=None, position_ids=None, vis_input=True, len_vis_input=49):
         seq_length = input_ids.size(1)
         if position_ids is None:
             position_ids = torch.arange(
@@ -224,20 +224,27 @@ class BertEmbeddings(nn.Module):
             token_type_ids = torch.zeros_like(input_ids)
 
         words_embeddings = self.word_embeddings(input_ids)
+
         position_embeddings = self.position_embeddings(position_ids)
-        if vis_input:
+        if vis_input: #replace <UNK> with vis_feats
             words_embeddings = torch.cat((words_embeddings[:, :1], vis_feats,
                 words_embeddings[:, len_vis_input+1:]), dim=1)
             assert len_vis_input == 100, 'only support region attn!'
             position_embeddings = torch.cat((position_embeddings[:, :1], vis_pe,
                 position_embeddings[:, len_vis_input+1:]), dim=1) # hacky...
+
+
         token_type_embeddings = self.token_type_embeddings(token_type_ids)
 
+
         embeddings = words_embeddings + position_embeddings + token_type_embeddings
+
         if self.fp32_embedding:
             embeddings = embeddings.half()
         embeddings = self.LayerNorm(embeddings)
+
         embeddings = self.dropout(embeddings)
+
         return embeddings
 
 
@@ -613,6 +620,8 @@ class PreTrainedBertModel(nn.Module):
         config = BertConfig.from_json_file(config_file)
 
         # define new type_vocab_size (there might be different numbers of segment ids)
+        if 'vocab_size' in kwargs:
+            config.vocab_size = kwargs['vocab_size']
         if 'type_vocab_size' in kwargs:
             config.type_vocab_size = kwargs['type_vocab_size']
         # define new relax_projection
@@ -638,7 +647,7 @@ class PreTrainedBertModel(nn.Module):
         logger.info("Model config {}".format(config))
 
         # clean the arguments in kwargs
-        for arg_clean in ('config_path', 'type_vocab_size', 'relax_projection', 'task_idx', 'max_position_embeddings', 'fp32_embedding', 'label_smoothing', 'drop_prob'):
+        for arg_clean in ('vocab_size', 'config_path', 'type_vocab_size', 'relax_projection', 'task_idx', 'max_position_embeddings', 'fp32_embedding', 'label_smoothing', 'drop_prob'):
             if arg_clean in kwargs:
                 del kwargs[arg_clean]
 
@@ -662,22 +671,49 @@ class PreTrainedBertModel(nn.Module):
         for old_key, new_key in zip(old_keys, new_keys):
             state_dict[new_key] = state_dict.pop(old_key)
 
+        # initialize new vocabulary embeddings
+        _k = 'bert.embeddings.word_embeddings.weight'
+        if (_k in state_dict) and (config.vocab_size != state_dict[_k].shape[0]):
+            n0 = state_dict[_k].shape[0]
+            logger.info("config.vocab_size != state_dict[bert.embeddings.word_embeddings.weight] ({0} != {1})".format(
+                            config.vocab_size, state_dict[_k].shape[0])) 
+            #print(model.bert.embeddings.token_type_embeddings.weight)
+            #print(model.bert.embeddings.word_embeddings.weight.shape)    
+            if config.vocab_size > state_dict[_k].shape[0]:  
+                state_dict[_k].data = state_dict[_k].resize_(
+                    config.vocab_size, state_dict[_k].shape[1]).data   
+                state_dict[_k].data[n0:,:].copy_(model.bert.embeddings.word_embeddings.weight[n0:,:])             
+            else:
+                state_dict[_k].data = state_dict[_k].data[:config.vocab_size, :]
         # initialize new segment embeddings
         _k = 'bert.embeddings.token_type_embeddings.weight'
         if (_k in state_dict) and (config.type_vocab_size != state_dict[_k].shape[0]):
+            n0 = state_dict[_k].shape[0]
             logger.info("config.type_vocab_size != state_dict[bert.embeddings.token_type_embeddings.weight] ({0} != {1})".format(
                 config.type_vocab_size, state_dict[_k].shape[0]))
             if config.type_vocab_size > state_dict[_k].shape[0]:
                 # state_dict[_k].data = state_dict[_k].data.resize_(
                 state_dict[_k].data = state_dict[_k].resize_(
                     config.type_vocab_size, state_dict[_k].shape[1]).data
-                if config.type_vocab_size >= 6:
+                if config.type_vocab_size >= 12 and n0>=6:
+                    #zh (6,7,9,11)
+                    #print(model.bert.embeddings.token_type_embeddings.weight.shape)
+                    #print(model.bert.embeddings.token_type_embeddings.weight)
+                    state_dict[_k].data[6, :].copy_(model.bert.embeddings.token_type_embeddings.weight[6,:])
+                    state_dict[_k].data[7, :].copy_(model.bert.embeddings.token_type_embeddings.weight[6,:])
+                    state_dict[_k].data[9, :].copy_(model.bert.embeddings.token_type_embeddings.weight[6,:])
+                    state_dict[_k].data[11, :].copy_(model.bert.embeddings.token_type_embeddings.weight[6,:])
+                    #s2s en 
+                    state_dict[_k].data[10, :].copy_(state_dict[_k].data[5, :])
+                    state_dict[_k].data[8, :].copy_(state_dict[_k].data[1, :])
+
+                elif config.type_vocab_size >= 6:
                     # L2R
                     state_dict[_k].data[2, :].copy_(state_dict[_k].data[0, :])
                     # R2L
                     state_dict[_k].data[3, :].copy_(state_dict[_k].data[0, :])
                     # S2S
-                    state_dict[_k].data[4, :].copy_(state_dict[_k].data[0, :])
+                    state_dict[_k].data[4, :].copy_(state_dict[_k].data[0, :]) #copy bid
                     state_dict[_k].data[5, :].copy_(state_dict[_k].data[1, :])
             elif config.type_vocab_size < state_dict[_k].shape[0]:
                 state_dict[_k].data = state_dict[_k].data[:config.type_vocab_size, :]
@@ -833,19 +869,25 @@ class BertModel(PreTrainedBertModel):
         return extended_attention_mask
 
 
-    def forward(self, vis_feats, vis_pe, input_ids, token_type_ids=None, attention_mask=None, output_all_encoded_layers=True, len_vis_input=49):
+    def forward(self, mode, vis_feats=None, vis_pe=None, input_ids=None, token_type_ids=None, attention_mask=None, output_all_encoded_layers=True, len_vis_input=49):
         extended_attention_mask = self.get_extended_attention_mask(
             input_ids, token_type_ids, attention_mask)
 
         # hack to load vis feats
-        embedding_output = self.embeddings(vis_feats, vis_pe, input_ids, token_type_ids, len_vis_input=len_vis_input)
+
+        embedding_output = self.embeddings(vis_feats=vis_feats, vis_pe=vis_pe, 
+            input_ids=input_ids, token_type_ids=token_type_ids, len_vis_input=len_vis_input,
+            vis_input=(mode=='img2txt'))
+
         encoded_layers = self.encoder(embedding_output,
                                       extended_attention_mask,
                                       output_all_encoded_layers=output_all_encoded_layers)
         sequence_output = encoded_layers[-1]
+
         pooled_output = self.pooler(sequence_output)
         if not output_all_encoded_layers:
             encoded_layers = encoded_layers[-1]
+
         return encoded_layers, pooled_output
 
 
@@ -1030,34 +1072,39 @@ class BertForPreTrainingLossMask(PreTrainedBertModel):
             self.vqa2_crit = nn.BCEWithLogitsLoss()
 
 
-    def forward(self, vis_feats, vis_pe, input_ids, token_type_ids=None, attention_mask=None, masked_lm_labels=None, ans_labels=None, next_sentence_label=None, masked_pos=None, masked_weights=None, task_idx=None, vis_masked_pos=[], mask_image_regions=False, drop_worst_ratio=0.2, vqa_inference=False):
+    def forward(self, mode, vis_feats=None, vis_pe=None, input_ids=None, token_type_ids=None, attention_mask=None, masked_lm_labels=None, ans_labels=None, next_sentence_label=None, masked_pos=None, masked_weights=None, task_idx=None, vis_masked_pos=[], mask_image_regions=False, drop_worst_ratio=0.2, vqa_inference=False):
 
-        vis_feats = self.vis_embed(vis_feats) # image region features
-        vis_pe = self.vis_pe_embed(vis_pe) # image region positional encodings
+        if mode == 'img2txt':
+            vis_feats = self.vis_embed(vis_feats) # image region features
+            vis_pe = self.vis_pe_embed(vis_pe) # image region positional encodings
 
-        # VQA inference
-        if vqa_inference:
-            assert(ans_labels == None)
-            sequence_output, pooled_output = self.bert(vis_feats, vis_pe, input_ids, token_type_ids,
-                attention_mask, output_all_encoded_layers=False, len_vis_input=self.len_vis_input)
+            # VQA inference
+            if vqa_inference:
+                assert(ans_labels == None)
+                sequence_output, pooled_output = self.bert(mode, 
+                    vis_feats, vis_pe, input_ids, token_type_ids,
+                    attention_mask, output_all_encoded_layers=False, len_vis_input=self.len_vis_input)
 
-            vqa2_embed = sequence_output[:, 0]*sequence_output[:, self.len_vis_input+1]
-            vqa2_pred = self.ans_classifier(vqa2_embed)
-            ans_idx = torch.max(vqa2_pred[:, 1:], -1)[1] + 1
-            return ans_idx
+                vqa2_embed = sequence_output[:, 0]*sequence_output[:, self.len_vis_input+1]
+                vqa2_pred = self.ans_classifier(vqa2_embed)
+                ans_idx = torch.max(vqa2_pred[:, 1:], -1)[1] + 1
+                return ans_idx
 
-        # zero out vis_masked_pos
-        if mask_image_regions:
-            vis_feat_mask = vis_masked_pos.new(*vis_feats.size()[:2], 1).fill_(0).byte()
-            for bb in range(vis_masked_pos.size(0)):
-                for pp in range(vis_masked_pos.size(1)):
-                    vis_feat_mask[bb, vis_masked_pos[bb, pp]-1] = 1
-            sequence_output, pooled_output = self.bert(vis_feats.masked_fill(vis_feat_mask, 0.),
-                vis_pe.masked_fill(vis_feat_mask, 0.), input_ids, token_type_ids,
-                attention_mask, output_all_encoded_layers=False, len_vis_input=self.len_vis_input)
-        else:
-            sequence_output, pooled_output = self.bert(vis_feats, vis_pe, input_ids, token_type_ids,
-                attention_mask, output_all_encoded_layers=False, len_vis_input=self.len_vis_input)
+            # zero out vis_masked_pos
+            if mask_image_regions:
+                vis_feat_mask = vis_masked_pos.new(*vis_feats.size()[:2], 1).fill_(0).byte()
+                for bb in range(vis_masked_pos.size(0)):
+                    for pp in range(vis_masked_pos.size(1)):
+                        vis_feat_mask[bb, vis_masked_pos[bb, pp]-1] = 1
+                sequence_output, pooled_output = self.bert(mode, vis_feats.masked_fill(vis_feat_mask, 0.),
+                    vis_pe.masked_fill(vis_feat_mask, 0.), input_ids, token_type_ids,
+                    attention_mask, output_all_encoded_layers=False, len_vis_input=self.len_vis_input)
+            else:
+                sequence_output, pooled_output = self.bert(mode, vis_feats, vis_pe, input_ids, token_type_ids,
+                    attention_mask, output_all_encoded_layers=False, len_vis_input=self.len_vis_input)
+        elif mode=='txt2txt':
+            sequence_output, pooled_output = self.bert(mode, input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask,
+                output_all_encoded_layers=False)
 
         if masked_lm_labels is None or next_sentence_label is None:
             raise NotImplementedError
@@ -1099,8 +1146,10 @@ class BertForPreTrainingLossMask(PreTrainedBertModel):
         else:
             sequence_output_masked = gather_seq_out_by_pos(
                 sequence_output, masked_pos)
+
             prediction_scores_masked, _ = self.cls(
                 sequence_output_masked, pooled_output, task_idx=task_idx)
+
             if self.crit_mask_lm_smoothed:
                 masked_lm_loss = self.crit_mask_lm_smoothed(
                     F.log_softmax(prediction_scores_masked.float(), dim=-1), masked_lm_labels)
@@ -1110,7 +1159,7 @@ class BertForPreTrainingLossMask(PreTrainedBertModel):
             masked_lm_loss = loss_mask_and_normalize(
                 masked_lm_loss.float(), masked_weights, drop_worst_ratio)
 
-        if mask_image_regions:
+        if mode == 'img2txt' and mask_image_regions:
             # Selfie-like pretext
             masked_vis_feats = torch.gather(vis_feats, 1,
                 (vis_masked_pos-1).unsqueeze(-1).expand((-1, -1, vis_feats.size(-1))))

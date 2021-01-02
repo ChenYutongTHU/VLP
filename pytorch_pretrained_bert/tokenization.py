@@ -68,6 +68,8 @@ class Indexer:
             else:
                 ids.append(self.vocab[token])
         return ids
+    def __len__(self):
+        return len(self.vocab)
 
 def load_vocab(vocab_files):
     """Loads a vocabulary file into a dictionary."""

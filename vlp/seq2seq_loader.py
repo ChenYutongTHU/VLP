@@ -317,9 +317,7 @@ class Preprocess4Seq2seqBilingual(Pipeline):
         else:
             segment_ids = SEGMENT_IDS['en'] * (len(tokens_a)+2) + SEGMENT_IDS['zh'] * (len(tokens_b)+1)
 
-        effective_length = len(tokens_a + tokens_b)
-        n_pred = min(self.max_pred, max(
-            1, int(round(effective_length * self.mask_prob))))
+
 
 
         # candidate positions of masked tokens
@@ -330,6 +328,8 @@ class Preprocess4Seq2seqBilingual(Pipeline):
             mask_type = 'a'
         else: # mask en b
             mask_type = 'b'
+
+
         for i, tk in enumerate(tokens):
             #for bilingual dataset, we can mask both tokens
             if not self.preprocessed and tk in ['[CLS]', '[SEP]']:
@@ -342,7 +342,11 @@ class Preprocess4Seq2seqBilingual(Pipeline):
                 elif mask_type=='b' and i>=2+len(tokens_a):
                     cand_pos.append(i)
         shuffle(cand_pos)
+        n_pred = min(self.max_pred, max(
+            1, int(round(len(cand_pos) * self.mask_prob))))
 
+        # if n_pred==3:
+        #     assert len(cand_pos)>=3, cand_pos
         masked_pos = cand_pos[:n_pred]
         masked_tokens = [tokens[pos] for pos in masked_pos]
         for pos in masked_pos:
@@ -398,6 +402,7 @@ class Preprocess4Seq2seqBilingual(Pipeline):
             masked_ids.extend([0] * n_pad)
             masked_pos.extend([0] * n_pad)
             masked_weights.extend([0] * n_pad)
+        assert len(masked_ids)==3 and len(masked_pos)==3 and len(masked_weights)==3, [len(masked_ids),len(masked_pos),len(masked_weights),self.max_pred, n_pred]
 
         return (self.corpus,self.mode), (input_ids, segment_ids, input_mask, masked_ids, masked_pos, masked_weights, -1, self.task_idx)#, img, vis_masked_pos, vis_pe, ans_tk)
 

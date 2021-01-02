@@ -442,7 +442,8 @@ def main():
     # Prepare model
     recover_step = _get_max_epoch_model(args.output_dir)
     cls_num_labels = 2
-    type_vocab_size = 6 if args.new_segment_ids else 2
+    #type_vocab_size = 6 if args.new_segment_ids else 2
+    type_vocab_size = 12 if args.new_segment_ids else 2
     relax_projection = 4 if args.relax_projection else 0
     task_idx_proj = 3 if args.tasks == 'img2txt' else 0
     mask_word_id, eos_word_ids, pad_word_ids = indexer(["[MASK]", "[SEP]", "[PAD]"]) # index in BERT vocab: 103, 102, 0
@@ -454,6 +455,7 @@ def main():
         _state_dict = {} if args.from_scratch else None
         model = BertForPreTrainingLossMask.from_pretrained(
             args.bert_model, state_dict=_state_dict, num_labels=cls_num_labels,
+            vocab_size=len(indexer),
             type_vocab_size=type_vocab_size, relax_projection=relax_projection,
             config_path=args.config_path, task_idx=task_idx_proj,
             max_position_embeddings=args.max_position_embeddings, label_smoothing=args.label_smoothing,
@@ -477,6 +479,7 @@ def main():
         if not args.scst:
             model = BertForPreTrainingLossMask.from_pretrained(
                 args.bert_model, state_dict=model_recover, num_labels=cls_num_labels,
+                vocab_size=len(indexer),
                 type_vocab_size=type_vocab_size, relax_projection=relax_projection,
                 config_path=args.config_path, task_idx=task_idx_proj,
                 max_position_embeddings=args.max_position_embeddings, label_smoothing=args.label_smoothing,
@@ -594,95 +597,101 @@ def main():
             scst_reward = []
             for step, iter_output in enumerate(iter_bar):
                 info_, batch = iter_output[0], iter_output[1]
-                logger.info('rank {}, step {}'.format(torch.distributed.get_rank(), step))
-                logger.info(info_)
-                #input()
-                continue
+                # logger.info('rank {}, step {}'.format(torch.distributed.get_rank(), step))
+                # logger.info(info_)
                 batch = [t.to(device) for t in batch]
 
                 if info_[0][0] in ['coco','aic']:
                     input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx, img, vis_masked_pos, vis_pe, ans_labels = batch
-                elif info[0][0] in ['wmt']:
+                    # if args.fp16:
+                    #     img = img.half()
+                    #     vis_pe = vis_pe.half()
+
+                    if args.enable_butd:
+                        conv_feats = img.data # Bx100x2048
+                        vis_pe = vis_pe.data
+                    else:
+                        conv_feats, _ = cnn(img.data) # Bx2048x7x7
+                        conv_feats = conv_feats.view(conv_feats.size(0), conv_feats.size(1),
+                            -1).permute(0,2,1).contiguous()
+                    # print('input_Ids \n')
+                    # print(input_ids.shape)
+                    # print(input_ids[0])
+                    # input()
+                    # print('segment_ids \n')
+                    # print(segment_ids.shape)
+                    # print(segment_ids[0])
+                    # input()
+                    # print('input_mask \n')
+                    # print(input_mask.shape)
+                    # torch.set_printoptions(profile='full')
+                    # print(input_mask[0,:60])
+                    # input()
+                    # print('lm label ids \n')
+                    # print(lm_label_ids.shape)
+                    # print(lm_label_ids[0])
+                    # input()
+                    # print('masked pos \n')
+                    # print(masked_pos.shape)
+                    # print(masked_pos[0])
+                    # input()
+
+
+                    if not args.scst:
+                        loss_tuple = model('img2txt',conv_feats, vis_pe, input_ids, segment_ids,
+                            input_mask, lm_label_ids, ans_labels, is_next, masked_pos=masked_pos,
+                            masked_weights=masked_weights, task_idx=task_idx,
+                            vis_masked_pos=vis_masked_pos, mask_image_regions=args.mask_image_regions,
+                            drop_worst_ratio=args.max_drop_worst_ratio if i_epoch > args.drop_after else 0)
+                        mean_reward = loss_tuple[0].new(1).fill_(0)
+                    else:
+                        # scst training
+                        model.eval()
+                        position_ids = torch.arange(input_ids.size(1), dtype=input_ids.dtype,
+                            device=input_ids.device).unsqueeze(0).expand_as(input_ids)
+                        input_dummy = input_ids[:, :args.len_vis_input + 2] # +2 for [CLS] and [SEP]
+                        greedy_res = input_ids.new(input_ids.size(0), input_ids.size(1)-args.len_vis_input-2).fill_(0)
+                        gen_result = input_ids.new(input_ids.size(0), input_ids.size(1)-args.len_vis_input-2).fill_(0)
+
+                        with torch.no_grad():
+                            greedy_res_raw, _ = model(conv_feats, vis_pe, input_dummy, segment_ids,
+                                position_ids, input_mask, task_idx=task_idx, sample_mode='greedy')
+                            for b in range(greedy_res_raw.size(0)):
+                                for idx in range(greedy_res_raw.size(1)):
+                                    if greedy_res_raw[b][idx] not in [eos_word_ids, pad_word_ids]:
+                                        greedy_res[b][idx] = greedy_res_raw[b][idx]
+                                    else:
+                                        if greedy_res_raw[b][idx] == eos_word_ids:
+                                            greedy_res[b][idx] = eos_word_ids
+                                        break
+                        model.train()
+                        gen_result_raw, sample_logprobs = model(conv_feats, vis_pe, input_dummy, segment_ids,
+                            position_ids, input_mask, task_idx=task_idx, sample_mode='sample')
+                        for b in range(gen_result_raw.size(0)):
+                            for idx in range(gen_result_raw.size(1)):
+                                if gen_result_raw[b][idx] not in [eos_word_ids, pad_word_ids]:
+                                    gen_result[b][idx] = gen_result_raw[b][idx]
+                                else:
+                                    if gen_result_raw[b][idx] == eos_word_ids:
+                                        gen_result[b][idx] = eos_word_ids
+                                    break
+
+                        gt_ids = input_ids[:, args.len_vis_input+2:]
+                        reward = get_self_critical_reward(greedy_res, gt_ids, gen_result, gt_ids.size(0))
+                        reward = torch.from_numpy(reward).float().to(gen_result.device)
+                        mean_reward = reward.mean()
+                        loss = rl_crit(sample_logprobs, gen_result.data, reward)
+
+                        loss_tuple = [loss, loss.new(1).fill_(0.), loss.new(1).fill_(0.)]
+                else:  #wmt
                     input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx = batch
-                # print('input_Ids \n')
-                # print(input_ids.shape)
-                # print(input_ids[0])
-                # input()
-                # print('segment_ids \n')
-                # print(segment_ids.shape)
-                # print(segment_ids[0])
-                # input()
-                # print('input_mask \n')
-                # print(input_mask.shape)
-                # torch.set_printoptions(profile='full')
-                # print(input_mask[0,:60])
-                # input()
-                # print('lm label ids \n')
-                # print(lm_label_ids.shape)
-                # print(lm_label_ids[0])
-                # input()
-                # print('masked pos \n')
-                # print(masked_pos.shape)
-                # print(masked_pos[0])
-                # input()
-                # if args.fp16:
-                #     img = img.half()
-                #     vis_pe = vis_pe.half()
-
-                if args.enable_butd:
-                    conv_feats = img.data # Bx100x2048
-                    vis_pe = vis_pe.data
-                else:
-                    conv_feats, _ = cnn(img.data) # Bx2048x7x7
-                    conv_feats = conv_feats.view(conv_feats.size(0), conv_feats.size(1),
-                        -1).permute(0,2,1).contiguous()
-
-                if not args.scst:
-                    loss_tuple = model(conv_feats, vis_pe, input_ids, segment_ids,
-                        input_mask, lm_label_ids, ans_labels, is_next, masked_pos=masked_pos,
-                        masked_weights=masked_weights, task_idx=task_idx,
-                        vis_masked_pos=vis_masked_pos, mask_image_regions=args.mask_image_regions,
+                    loss_tuple = model('txt2txt', 
+                        input_ids=input_ids, token_type_ids=segment_ids,
+                        attention_mask=input_mask, masked_lm_labels=lm_label_ids, 
+                        ans_labels=None, next_sentence_label=is_next, 
+                        masked_pos=masked_pos, masked_weights=masked_weights, task_idx=task_idx,
                         drop_worst_ratio=args.max_drop_worst_ratio if i_epoch > args.drop_after else 0)
                     mean_reward = loss_tuple[0].new(1).fill_(0)
-                else:
-                    # scst training
-                    model.eval()
-                    position_ids = torch.arange(input_ids.size(1), dtype=input_ids.dtype,
-                        device=input_ids.device).unsqueeze(0).expand_as(input_ids)
-                    input_dummy = input_ids[:, :args.len_vis_input + 2] # +2 for [CLS] and [SEP]
-                    greedy_res = input_ids.new(input_ids.size(0), input_ids.size(1)-args.len_vis_input-2).fill_(0)
-                    gen_result = input_ids.new(input_ids.size(0), input_ids.size(1)-args.len_vis_input-2).fill_(0)
-
-                    with torch.no_grad():
-                        greedy_res_raw, _ = model(conv_feats, vis_pe, input_dummy, segment_ids,
-                            position_ids, input_mask, task_idx=task_idx, sample_mode='greedy')
-                        for b in range(greedy_res_raw.size(0)):
-                            for idx in range(greedy_res_raw.size(1)):
-                                if greedy_res_raw[b][idx] not in [eos_word_ids, pad_word_ids]:
-                                    greedy_res[b][idx] = greedy_res_raw[b][idx]
-                                else:
-                                    if greedy_res_raw[b][idx] == eos_word_ids:
-                                        greedy_res[b][idx] = eos_word_ids
-                                    break
-                    model.train()
-                    gen_result_raw, sample_logprobs = model(conv_feats, vis_pe, input_dummy, segment_ids,
-                        position_ids, input_mask, task_idx=task_idx, sample_mode='sample')
-                    for b in range(gen_result_raw.size(0)):
-                        for idx in range(gen_result_raw.size(1)):
-                            if gen_result_raw[b][idx] not in [eos_word_ids, pad_word_ids]:
-                                gen_result[b][idx] = gen_result_raw[b][idx]
-                            else:
-                                if gen_result_raw[b][idx] == eos_word_ids:
-                                    gen_result[b][idx] = eos_word_ids
-                                break
-
-                    gt_ids = input_ids[:, args.len_vis_input+2:]
-                    reward = get_self_critical_reward(greedy_res, gt_ids, gen_result, gt_ids.size(0))
-                    reward = torch.from_numpy(reward).float().to(gen_result.device)
-                    mean_reward = reward.mean()
-                    loss = rl_crit(sample_logprobs, gen_result.data, reward)
-
-                    loss_tuple = [loss, loss.new(1).fill_(0.), loss.new(1).fill_(0.)]
 
                 # disable pretext_loss_deprecated for now
                 masked_lm_loss, pretext_loss_deprecated, ans_loss = loss_tuple
@@ -690,7 +699,7 @@ def main():
                     masked_lm_loss = masked_lm_loss.mean()
                     pretext_loss_deprecated = pretext_loss_deprecated.mean()
                     ans_loss = ans_loss.mean()
-                loss = masked_lm_loss + pretext_loss_deprecated + ans_loss
+                loss = masked_lm_loss #+ pretext_loss_deprecated + ans_loss
 
                 # logging for each step (i.e., before normalization by args.gradient_accumulation_steps)
                 iter_bar.set_description('Iter (loss=%5.3f)' % loss.item())
@@ -749,7 +758,7 @@ def main():
 
                     if args.enable_tensorboard and global_step%args.summary_steps==0:
                         if args.local_rank in [-1,0]:
-                            writer.add_scalar('Training_Loss', train_loss[-1], global_step)
+                            writer.add_scalar('Training_Loss_{}'.format(info_[0][0]), train_loss[-1], global_step)
 
                     global_step += 1
 

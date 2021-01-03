@@ -222,7 +222,6 @@ class BertEmbeddings(nn.Module):
             position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
         if token_type_ids is None:
             token_type_ids = torch.zeros_like(input_ids)
-
         words_embeddings = self.word_embeddings(input_ids)
 
         position_embeddings = self.position_embeddings(position_ids)
@@ -672,7 +671,7 @@ class PreTrainedBertModel(nn.Module):
             state_dict[new_key] = state_dict.pop(old_key)
 
         # initialize new vocabulary embeddings
-        _k = 'bert.embeddings.word_embeddings.weight'
+        _k = 'bert.embeddings.word_embeddings.weight' #'cls.predictions.bias'
         if (_k in state_dict) and (config.vocab_size != state_dict[_k].shape[0]):
             n0 = state_dict[_k].shape[0]
             logger.info("config.vocab_size != state_dict[bert.embeddings.word_embeddings.weight] ({0} != {1})".format(
@@ -685,6 +684,17 @@ class PreTrainedBertModel(nn.Module):
                 state_dict[_k].data[n0:,:].copy_(model.bert.embeddings.word_embeddings.weight[n0:,:])             
             else:
                 state_dict[_k].data = state_dict[_k].data[:config.vocab_size, :]
+        _k = 'cls.predictions.bias'
+        if (_k in state_dict) and (config.vocab_size != state_dict[_k].shape[0]):
+            n0 = state_dict[_k].shape[0]
+            logger.info("config.vocab_size != state_dict[cls.predictions.bias] ({0} != {1})".format(
+                            config.vocab_size, n0))
+            if config.vocab_size > n0:  
+                state_dict[_k].data = state_dict[_k].resize_(config.vocab_size).data   
+                state_dict[_k].data[n0:].copy_(model.cls.predictions.bias[n0:])             
+            else:
+                state_dict[_k].data = state_dict[_k].data[:config.vocab_size]             
+
         # initialize new segment embeddings
         _k = 'bert.embeddings.token_type_embeddings.weight'
         if (_k in state_dict) and (config.type_vocab_size != state_dict[_k].shape[0]):
@@ -784,6 +794,7 @@ class PreTrainedBertModel(nn.Module):
             for name, child in module._modules.items():
                 if child is not None:
                     load(child, prefix + name + '.')
+
         load(model, prefix='' if hasattr(model, 'bert') else 'bert.')
         model.missing_keys = missing_keys
         if len(missing_keys) > 0:
@@ -797,6 +808,7 @@ class PreTrainedBertModel(nn.Module):
         if tempdir:
             # Clean up temp dir
             shutil.rmtree(tempdir)
+
         return model
 
 
@@ -863,8 +875,10 @@ class BertModel(PreTrainedBertModel):
         # positions we want to attend and -10000.0 for masked positions.
         # Since we are adding it to the raw scores before the softmax, this is
         # effectively the same as removing these entirely.
+        extended_attention_mask
         extended_attention_mask = extended_attention_mask.to(
             dtype=next(self.parameters()).dtype)  # fp16 compatibility
+        #extended_attention_mask = extended_attention_mask.half()
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         return extended_attention_mask
 
@@ -1030,6 +1044,10 @@ class BertForPreTrainingLossMask(PreTrainedBertModel):
         self.cls = BertPreTrainingHeads(
             config, self.bert.embeddings.word_embeddings.weight, num_labels=num_labels) # num_labels not applicable for VLP
         self.apply(self.init_bert_weights)
+        # print('Before load ..')
+        # print(self.bert.embeddings.word_embeddings.weight)
+        # print(self.cls.predictions.decoder.weight)
+        # input()
         self.crit_mask_lm = nn.CrossEntropyLoss(reduction='none')
         self.num_labels = num_labels
         self.len_vis_input = len_vis_input

@@ -167,6 +167,7 @@ def main():
     parser.add_argument('--visdom_port', type=int, default=8888)
     parser.add_argument('--enable_tensorboard', action='store_true')
     parser.add_argument('--summary_steps', type=int, default=100)
+    parser.add_argument('--save_steps', type=int, default=5000)
     # parser.add_argument('--resnet_model', type=str, default='imagenet_weights/resnet101.pth')
     parser.add_argument('--split', type=str, nargs='+', default=['train', 'restval'])
 
@@ -550,12 +551,17 @@ def main():
         model, optimizer = amp.initialize(model, optimizer, opt_level='O2')#'02')
 
     if args.local_rank != -1:
-        try:
-            from apex.parallel import DistributedDataParallel as DDP 
-        except ImportError:
-            raise ImportError(
-                'Please install apex from https://www.github.com/nvidia/apex to use distributed fp16 for training.')
-        model = DDP(model)
+        if args.amp:
+            try:
+                from apex.parallel import DistributedDataParallel as DDP 
+            except ImportError:
+                raise ImportError(
+                    'Please install apex from https://www.github.com/nvidia/apex to use distributed fp16 for training.')
+            model = DDP(model,delay_allreduce=True)
+        else:
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
+                                                              output_device=args.local_rank,
+                                                              find_unused_parameters=True)
     elif n_gpu > 1:
         model = DataParallelImbalance(model)
 
@@ -595,18 +601,13 @@ def main():
             pretext_loss = []
             vqa2_loss = []
             scst_reward = []
+            is_first=True
             for step, iter_output in enumerate(iter_bar):
-                info_, batch = iter_output[0], iter_output[1]
-                # logger.info('rank {}, step {}'.format(torch.distributed.get_rank(), step))
-                # logger.info(info_)
+                info_, batch = iter_output[0], iter_output[1]   
                 batch = [t.to(device) for t in batch]
 
                 if info_[0][0] in ['coco','aic']:
                     input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx, img, vis_masked_pos, vis_pe, ans_labels = batch
-                    # if args.fp16:
-                    #     img = img.half()
-                    #     vis_pe = vis_pe.half()
-
                     if args.enable_butd:
                         conv_feats = img.data # Bx100x2048
                         vis_pe = vis_pe.data
@@ -614,36 +615,18 @@ def main():
                         conv_feats, _ = cnn(img.data) # Bx2048x7x7
                         conv_feats = conv_feats.view(conv_feats.size(0), conv_feats.size(1),
                             -1).permute(0,2,1).contiguous()
-                    # print('input_Ids \n')
-                    # print(input_ids.shape)
-                    # print(input_ids[0])
-                    # input()
-                    # print('segment_ids \n')
-                    # print(segment_ids.shape)
-                    # print(segment_ids[0])
-                    # input()
-                    # print('input_mask \n')
-                    # print(input_mask.shape)
-                    # torch.set_printoptions(profile='full')
-                    # print(input_mask[0,:60])
-                    # input()
-                    # print('lm label ids \n')
-                    # print(lm_label_ids.shape)
-                    # print(lm_label_ids[0])
-                    # input()
-                    # print('masked pos \n')
-                    # print(masked_pos.shape)
-                    # print(masked_pos[0])
-                    # input()
-
 
                     if not args.scst:
+                        model.train()
                         loss_tuple = model('img2txt',conv_feats, vis_pe, input_ids, segment_ids,
                             input_mask, lm_label_ids, ans_labels, is_next, masked_pos=masked_pos,
                             masked_weights=masked_weights, task_idx=task_idx,
                             vis_masked_pos=vis_masked_pos, mask_image_regions=args.mask_image_regions,
                             drop_worst_ratio=args.max_drop_worst_ratio if i_epoch > args.drop_after else 0)
                         mean_reward = loss_tuple[0].new(1).fill_(0)
+                        logger.info('coco/aic loss')
+                        logger.info(loss_tuple[0].item())
+                        #logger.info('coco/aic ', segment_ids)
                     else:
                         # scst training
                         model.eval()
@@ -685,12 +668,16 @@ def main():
                         loss_tuple = [loss, loss.new(1).fill_(0.), loss.new(1).fill_(0.)]
                 else:  #wmt
                     input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx = batch
+                    model.train()
                     loss_tuple = model('txt2txt', 
                         input_ids=input_ids, token_type_ids=segment_ids,
                         attention_mask=input_mask, masked_lm_labels=lm_label_ids, 
                         ans_labels=None, next_sentence_label=is_next, 
                         masked_pos=masked_pos, masked_weights=masked_weights, task_idx=task_idx,
                         drop_worst_ratio=args.max_drop_worst_ratio if i_epoch > args.drop_after else 0)
+                    logger.info('wmt loss')
+                    logger.info(loss_tuple[0].item())
+                    #logger.info('wmt ', segment_ids)
                     mean_reward = loss_tuple[0].new(1).fill_(0)
 
                 # disable pretext_loss_deprecated for now
@@ -760,20 +747,22 @@ def main():
                         if args.local_rank in [-1,0]:
                             writer.add_scalar('Training_Loss_{}'.format(info_[0][0]), train_loss[-1], global_step)
 
+                    if global_step%args.save_steps==0:
+                        # Save a trained model
+                        logger.info(
+                            "** ** * Saving fine-tuned model and optimizer ** ** * ")
+                        model_to_save = model.module if hasattr(
+                            model, 'module') else model  # Only save the model it-self
+                        output_model_file = os.path.join(
+                            args.output_dir, "model.{0}.bin".format(global_step))
+                        output_optim_file = os.path.join(
+                            args.output_dir, "optim.{0}.bin".format(global_step))
+                        if args.local_rank in (-1, 0): # save model if the first device or no dist
+                            torch.save(copy.deepcopy(model_to_save).cpu().state_dict(), output_model_file)
+                            # torch.save(optimizer.state_dict(), output_optim_file) # disable for now, need to sanitize state and ship everthing back to cpu
+
                     global_step += 1
 
-            # Save a trained model
-            logger.info(
-                "** ** * Saving fine-tuned model and optimizer ** ** * ")
-            model_to_save = model.module if hasattr(
-                model, 'module') else model  # Only save the model it-self
-            output_model_file = os.path.join(
-                args.output_dir, "model.{0}.bin".format(i_epoch))
-            output_optim_file = os.path.join(
-                args.output_dir, "optim.{0}.bin".format(i_epoch))
-            if args.local_rank in (-1, 0): # save model if the first device or no dist
-                torch.save(copy.deepcopy(model_to_save).cpu().state_dict(), output_model_file)
-                # torch.save(optimizer.state_dict(), output_optim_file) # disable for now, need to sanitize state and ship everthing back to cpu
 
             logger.info("***** CUDA.empty_cache() *****")
             torch.cuda.empty_cache()

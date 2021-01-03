@@ -740,7 +740,8 @@ class CombinedDataset(torch.utils.data.Dataset):
         return None
 
 class WeightedRandom_DistributedBatchSampler(torch.utils.data.Sampler):
-    def __init__(self, corpus_size, batch_size, alpha, num_batches, drop_last=False, num_replicas=None, rank=None, seed=0):
+    def __init__(self, corpus_size, batch_size, alpha, num_batches, gradient_accumulation_steps=None,
+        drop_last=False, num_replicas=None, rank=None, seed=0):
         #note that here 
         #batch_size -> batch_size_per_gpu
         #num_batches -> num_batches_per_gpu

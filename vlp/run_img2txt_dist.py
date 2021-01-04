@@ -28,8 +28,10 @@ from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
 
 from vlp.loader_utils import batch_list_to_batch_tensors
 import vlp.seq2seq_loader as seq2seq_loader
+from vlp.decode_img2txt import detokenize
 #from vlp.seq2seq_loader import Preprocess4Seq2seqBilingual
 from vlp.scst_utils import *
+from vlp.lang_utils import language_eval
 from misc.data_parallel import DataParallelImbalance
 
 
@@ -58,7 +60,6 @@ def main():
     parser.add_argument('--max_len_zh_cap', default=25, type=int, help='maximum length of Chinese in **img2txt** corpus')
     parser.add_argument('--len_vis_input', type=int, default=100, help="The length of visual token input")
     parser.add_argument('--wmt_N_lines', type=int, default=24752392, help='The total number of wmt lines')
-
     parser.add_argument("--src_file", default='$DATA_ROOT/{}/annotations/{}_dataset.json',
                         type=str, help="The input data file name.")
     parser.add_argument('--file_valid_jpgs', default='$DATA_ROOT/{}/annotations/{}_valid_jpgs.json', type=str)
@@ -196,6 +197,8 @@ def main():
                         help="Use different projection layers for tasks.")
     parser.add_argument('--scst', action='store_true',
                         help='Self-critical sequence training')
+    parser.add_argument('--length_penalty', type=float, default=0,
+                        help="Length penalty for beam search")
 
     args = parser.parse_args()
     dataset = {}
@@ -307,7 +310,9 @@ def main():
             if corpus in ['coco', 'aic']:
                 tokenizer = tokenizers['en'] if corpus=='coco' else tokenizers['zh']
                 bi_uni_pipeline = [seq2seq_loader.Preprocess4Seq2seq(
-                    corpus, args.max_pred, args.mask_prob,
+                    corpus, 
+                    'zh' if corpus in ['aic'] else 'en',
+                    args.max_pred, args.mask_prob,
                     list(tokenizer.vocab.keys()), indexer, max_len=args.dataset[corpus]['max_seq_length'],
                     preprocessed=True,
                     new_segment_ids=args.new_segment_ids, 
@@ -319,10 +324,12 @@ def main():
                     vis_mask_prob=args.vis_mask_prob, enable_butd=args.enable_butd,
                     region_bbox_file=args.region_bbox_file.format(corpus.upper(), corpus.lower()), 
                     region_det_file_prefix=args.region_det_file_prefix.format(corpus.upper(), corpus.lower()),
-                    local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2'), lang='zh' if corpus in ['aic'] else 'en')]
+                    local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2'))]
 
                 bi_uni_pipeline.append(seq2seq_loader.Preprocess4Seq2seq(
-                    corpus, args.max_pred, args.mask_prob,
+                    corpus, 
+                    'zh' if corpus in ['aic'] else 'en',
+                    args.max_pred, args.mask_prob,
                     list(tokenizer.vocab.keys()), indexer, max_len=args.dataset[corpus]['max_seq_length'],
                     preprocessed=True,
                     new_segment_ids=args.new_segment_ids,  
@@ -334,7 +341,7 @@ def main():
                     vis_mask_prob=args.vis_mask_prob, enable_butd=args.enable_butd,
                     region_bbox_file=args.region_bbox_file.format(corpus.upper(), corpus.lower()), 
                     region_det_file_prefix=args.region_det_file_prefix.format(corpus.upper(), corpus.lower()),
-                    local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2'), lang='zh' if corpus in ['aic'] else 'en'))
+                    local_rank=args.local_rank, load_vqa_ann=(args.tasks=='vqa2')))
 
                 split = args.split #'['train']
                 if corpus=='coco' and split[0]=='train':
@@ -350,6 +357,30 @@ def main():
                     bi_uni_pipeline=bi_uni_pipeline, use_num_imgs=args.use_num_imgs,
                     s2s_prob=args.s2s_prob, bi_prob=args.bi_prob,
                     enable_butd=args.enable_butd, tasks=args.tasks)
+
+
+                #----------------for validation----------------
+                if args.local_rank in [-1,0]:
+                    decode_pipeline = [seq2seq_loader.Preprocess4Seq2seqDecoder(
+                        corpus, 
+                        'zh' if corpus in ['aic'] else 'en',
+                        list(tokenizer.vocab.keys()), indexer, 
+                        max_len=args.dataset[corpus]['max_seq_length'],
+                        max_tgt_length=args.dataset[corpus]['max_len_b'], new_segment_ids=args.new_segment_ids,
+                        mode='s2s', len_vis_input=args.len_vis_input, enable_butd=args.enable_butd,
+                        region_bbox_file=args.region_bbox_file.format(corpus.upper(), corpus.lower()), 
+                        region_det_file_prefix=args.region_det_file_prefix.format(corpus.upper(), corpus.lower()))]
+                    args.dataset[corpus]['valid_dataset'] = seq2seq_loader.Img2txtDataset(
+                        args.src_file.format(corpus.upper(), corpus.lower()),
+                        args.image_root.format(corpus.upper()), 
+                        'val', args.train_batch_size,
+                        tokenizer,
+                        args.dataset[corpus]['max_seq_length'], 
+                        preprocessed=True,
+                        file_valid_jpgs=args.file_valid_jpgs.format(corpus.upper(), corpus.lower()),
+                        bi_uni_pipeline=decode_pipeline, use_num_imgs=args.use_num_imgs,
+                        s2s_prob=1, bi_prob=0,
+                        enable_butd=args.enable_butd, tasks=args.tasks)
 
             elif corpus == 'wmt':
                 #print(seq2seq_loader.__dict__)
@@ -388,6 +419,19 @@ def main():
                     tokenizers, args.dataset[corpus]['max_seq_length'], 
                     preprocessed=True,
                     bi_uni_pipeline=bi_uni_pipeline,s2s_prob=args.s2s_prob, bi_prob=args.bi_prob)  
+
+                # if args.local_rank in [-1,0]:
+                #     decode_pipeline = [seq2seq_loader.Preprocess4Seq2seqDecoderBilingual(list(
+                #         tokenizer.vocab.keys()), tokenizer.convert_tokens_to_ids, args.max_seq_length,
+                #         max_tgt_length=args.max_tgt_length, new_segment_ids=args.new_segment_ids,
+                #         mode='s2s', len_vis_input=args.len_vis_input, enable_butd=args.enable_butd,
+                #         region_bbox_file=args.region_bbox_file, region_det_file_prefix=args.region_det_file_prefix)]
+                #     args.dataset[corpus]['valid_dataset'] = seq2seq_loader.Txt2txtDataset(
+                #         args.wmt_N_lines,
+                #         'val', args.train_batch_size,
+                #         tokenizers, args.dataset[corpus]['max_seq_length'], 
+                #         preprocessed=True,
+                #         bi_uni_pipeline=bi_uni_pipeline,s2s_prob=1, bi_prob=0) 
         
 
         train_dataset = seq2seq_loader.CombinedDataset(
@@ -462,7 +506,10 @@ def main():
             max_position_embeddings=args.max_position_embeddings, label_smoothing=args.label_smoothing,
             fp32_embedding=args.fp32_embedding, cache_dir=args.output_dir+'/.pretrained_model_{}'.format(args.local_rank),
             drop_prob=args.drop_prob, enable_butd=args.enable_butd,
-            len_vis_input=args.len_vis_input, tasks=args.tasks)
+            len_vis_input=args.len_vis_input, tasks=args.tasks,
+            mask_word_id=mask_word_id, eos_id=eos_word_ids, 
+            length_penalty=args.length_penalty, forbid_duplicate_ngrams=False, forbid_ignore_set=None,
+            ngram_size=args.ngram_size, min_len=0)
         global_step = 0
     else:
         if recover_step:
@@ -486,6 +533,8 @@ def main():
                 max_position_embeddings=args.max_position_embeddings, label_smoothing=args.label_smoothing,
                 fp32_embedding=args.fp32_embedding, cache_dir=args.output_dir+'/.pretrained_model_{}'.format(args.local_rank),
                 drop_prob=args.drop_prob, enable_butd=args.enable_butd,
+                mask_word_id=mask_word_id, eos_id=eos_word_ids, 
+                length_penalty=args.length_penalty, forbid_duplicate_ngrams=False, forbid_ignore_set=None,
                 len_vis_input=args.len_vis_input, tasks=args.tasks)
         else:
             model = BertForSeq2SeqDecoder.from_pretrained(args.bert_model,
@@ -624,9 +673,6 @@ def main():
                             vis_masked_pos=vis_masked_pos, mask_image_regions=args.mask_image_regions,
                             drop_worst_ratio=args.max_drop_worst_ratio if i_epoch > args.drop_after else 0)
                         mean_reward = loss_tuple[0].new(1).fill_(0)
-                        logger.info('coco/aic loss')
-                        logger.info(loss_tuple[0].item())
-                        #logger.info('coco/aic ', segment_ids)
                     else:
                         # scst training
                         model.eval()
@@ -675,9 +721,6 @@ def main():
                         ans_labels=None, next_sentence_label=is_next, 
                         masked_pos=masked_pos, masked_weights=masked_weights, task_idx=task_idx,
                         drop_worst_ratio=args.max_drop_worst_ratio if i_epoch > args.drop_after else 0)
-                    logger.info('wmt loss')
-                    logger.info(loss_tuple[0].item())
-                    #logger.info('wmt ', segment_ids)
                     mean_reward = loss_tuple[0].new(1).fill_(0)
 
                 # disable pretext_loss_deprecated for now
@@ -760,6 +803,72 @@ def main():
                         if args.local_rank in (-1, 0): # save model if the first device or no dist
                             torch.save(copy.deepcopy(model_to_save).cpu().state_dict(), output_model_file)
                             # torch.save(optimizer.state_dict(), output_optim_file) # disable for now, need to sanitize state and ship everthing back to cpu
+
+                        if args.local_rank in [0,-1]:
+                            print('')
+                            logger.info("** ** * Validation global steps {} ** ** * ".format(global_step))
+                            for corpus in args.dataset:
+                                if 'valid_dataset' in args.dataset[corpus]:
+                                    print('Begin decoding '+corpus)
+                                    val_dataset = args.dataset[corpus]['valid_dataset']
+                                    val_dataloader = torch.utils.data.DataLoader(
+                                                val_dataset, batch_size=args.train_batch_size,
+                                                sampler=SequentialSampler(val_dataset), num_workers=args.num_workers, 
+                                                collate_fn=batch_list_to_batch_tensors, pin_memory=True)
+                                    logger.info("corpus {}".format(corpus))
+                                    model.eval()
+                                    output_lines = {}
+                                    val_iter_bar = tqdm(val_dataloader)
+                                    for step_val, val_iter_output in enumerate(val_iter_bar):
+                                        info_, batch = val_iter_output[0],val_iter_output[1]
+                                        with torch.no_grad():
+                                            batch = [t.to(device) for t in batch]
+                                            input_ids, segment_ids, position_ids, input_mask, task_idx, img, vis_pe = batch
+                                            # print(input_ids[0])
+                                            # print(segment_ids[0])
+                                            # print(position_ids[0])
+                                            # print(input_mask[0])
+                                            # input()
+                                            if args.enable_butd:
+                                                conv_feats = img.data # Bx100x2048
+                                                vis_pe = vis_pe.data
+                                            else:
+                                                conv_feats, _ = cnn(img.data) # Bx2048x7x7
+                                                conv_feats = conv_feats.view(conv_feats.size(0), conv_feats.size(1),
+                                                    -1).permute(0,2,1).contiguous()
+                                            if args.amp:
+                                                conv_feats = conv_feats.half()
+                                                vis_pe = vis_pe.half()
+
+                                            beam_size = 1
+                                            traces = model.decode(conv_feats, vis_pe, input_ids, segment_ids, position_ids, input_mask, 
+                                                search_beam_size=beam_size, task_idx=task_idx, sample_mode='greedy') #validation greedy
+                                            if beam_size > 1:
+                                                traces = {k: v.tolist() for k, v in traces.items()}
+                                                output_ids = traces['pred_seq']
+                                            else:
+                                                output_ids = traces[0].tolist()
+                                            for ii,w_ids in enumerate(output_ids):
+                                                output_buf = indexer.convert_ids_to_tokens(w_ids)
+                                                output_tokens = []
+                                                for t in output_buf:
+                                                    if t in ("[SEP]", "[PAD]"):
+                                                        break
+                                                    output_tokens.append(t)
+                                                output_sequence = ' '.join(detokenize(output_tokens))
+                                                if corpus=='coco':
+                                                    id_ = int(info_[ii][2].split('_')[2])
+                                                output_lines[id_] = output_sequence
+                                    predictions = [{'image_id': ids_, 'caption': output_lines[ids_]} for ids_ in output_lines]
+                                    with open(os.path.join(args.output_dir,'{}_{}_predictions.json').format(global_step, corpus),'w') as f:
+                                        json.dump(predictions, f)
+                                    print('Begin evaluating '+corpus)
+                                    lang_stats = language_eval(corpus, predictions, 
+                                        args.model_recover_path.split('/')[-2]+'-'+'val'+'-'+args.model_recover_path.split('/')[-1].split('.')[-2], 
+                                        'val',
+                                        ['Bleu','METEOR','Rouge','CIDEr'])
+                                    with open(os.path.join(args.output_dir,'{}_{}_scores.json').format(global_step, corpus),'w') as f:
+                                        json.dump(lang_stats, f)
 
                     global_step += 1
 

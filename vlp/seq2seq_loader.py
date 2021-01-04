@@ -168,15 +168,22 @@ class Img2txtDataset(torch.utils.data.Dataset):
                                 if enable_butd:
                                     src_tk = os.path.join(image_root, src.get('filepath', 'trainval'),
                                         src['filename'][:-4]+'.npy')
-                                    for sent in src['sentences']:
+                                    if split in ['val', 'test']:
                                         if self.preprocessed:
-                                            tgt_tk = sent['indices']
+                                            tgt_tk = src['sentences'][0]['indices']
                                         else:
-                                            tgt_tk = tokenizer.tokenize(sent['raw'])
-                                        assert len(tgt_tk) > 0
+                                            tgt_tk = tokenizer.tokenize(src['sentences'][0]['raw'])                                        
                                         self.ex_list.append((src_tk, tgt_tk, {'answers': ['dummy']}))
-                                        #if counter%10000 == 0:
-                                            #print(src_tk, tgt_tk)
+                                    else:
+                                        for sent in src['sentences']:
+                                            if self.preprocessed:
+                                                tgt_tk = sent['indices']
+                                            else:
+                                                tgt_tk = tokenizer.tokenize(sent['raw'])
+                                            assert len(tgt_tk) > 0
+                                            self.ex_list.append((src_tk, tgt_tk, {'answers': ['dummy']}))
+                                            #if counter%10000 == 0:
+                                                #print(src_tk, tgt_tk)
                                     counter += 1
                                 else:
                                     src_tk = os.path.join(image_root, src.get('filepath', ''),
@@ -209,13 +216,20 @@ class Img2txtDataset(torch.utils.data.Dataset):
                                         src['filename'])
                                 # check if the image is valid
                                 if src['filename'] in valid_jpgs:
-                                    for sent in src['sentences']:
+                                    if split in ['val', 'test']:
                                         if self.preprocessed:
-                                            tgt_tk = sent['indices']
+                                            tgt_tk = src['sentences'][0]['indices']
                                         else:
-                                            tgt_tk = tokenizer.tokenize(sent['raw'])  #to-do Chinese Tokenizer.tokenize?
-                                        assert len(tgt_tk) > 0
+                                            tgt_tk = tokenizer.tokenize(src['sentences'][0]['raw'])                                        
                                         self.ex_list.append((src_tk, tgt_tk, {'answers': ['dummy']}))
+                                    else:
+                                        for sent in src['sentences']:
+                                            if self.preprocessed:
+                                                tgt_tk = sent['indices']
+                                            else:
+                                                tgt_tk = tokenizer.tokenize(sent['raw'])
+                                            assert len(tgt_tk) > 0
+                                            self.ex_list.append((src_tk, tgt_tk, {'answers': ['dummy']}))
                                         # if counter%10000 == 0:
                                         #     print(src_tk, tgt_tk)
                                     counter += 1
@@ -243,8 +257,11 @@ class Img2txtDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         instance = self.ex_list[idx]
-        proc = choices(self.bi_uni_pipeline, weights=[self.s2s_prob, self.bi_prob])[0]
-        instance = proc(instance)
+        if len(self.bi_uni_pipeline)==1:
+            instance = self.bi_uni_pipeline[0](instance)
+        else:
+            proc = choices(self.bi_uni_pipeline, weights=[self.s2s_prob, self.bi_prob])[0]
+            instance = proc(instance)
         return instance
 
     def __iter__(self):  # iterator to load data
@@ -409,7 +426,7 @@ class Preprocess4Seq2seqBilingual(Pipeline):
 class Preprocess4Seq2seq(Pipeline):
     """ Pre-processing steps for pretraining transformer """
 
-    def __init__(self, corpus, max_pred, mask_prob, vocab_words, indexer, preprocessed=True, max_len=512, block_mask=False, new_segment_ids=False, truncate_config={}, mask_image_regions=False, mode="s2s", len_vis_input=49, vis_mask_prob=0.25, enable_butd=False, region_bbox_file='', region_det_file_prefix='', local_rank=-1, load_vqa_ann=False, lang='en'):
+    def __init__(self, corpus, lang, max_pred, mask_prob, vocab_words, indexer, preprocessed=True, max_len=512, block_mask=False, new_segment_ids=False, truncate_config={}, mask_image_regions=False, mode="s2s", len_vis_input=49, vis_mask_prob=0.25, enable_butd=False, region_bbox_file='', region_det_file_prefix='', local_rank=-1, load_vqa_ann=False):
         super().__init__()
         self.corpus = corpus
         self.max_pred = max_pred  # max tokens of prediction
@@ -610,8 +627,9 @@ class Preprocess4Seq2seq(Pipeline):
 class Preprocess4Seq2seqDecoder(Pipeline):  #to-do self.lang/ new_segment_id/ txt
     """ Pre-processing steps for pretraining transformer """
 
-    def __init__(self, vocab_words, indexer, max_len=512, max_tgt_length=128, new_segment_ids=False, mode="s2s", enable_butd=False, len_vis_input=49, region_bbox_file='', region_det_file_prefix='', lang='en'):
+    def __init__(self, corpus, lang, vocab_words, indexer, max_len=512, max_tgt_length=128, new_segment_ids=False, mode="s2s", enable_butd=False, len_vis_input=49, region_bbox_file='', region_det_file_prefix=''):
         super().__init__()
+        self.corpus = corpus
         self.vocab_words = vocab_words  # vocabulary (sub)words
         self.indexer = indexer  # function from token to token index
         self.max_len = max_len
@@ -637,33 +655,26 @@ class Preprocess4Seq2seqDecoder(Pipeline):  #to-do self.lang/ new_segment_id/ tx
             self.res_Normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
     def __call__(self, instance):
-        img_path, max_a_len = instance[:2]
+        img_path = instance[0]
         tokens_a = ['[UNK]'] * self.len_vis_input
 
         # Add Special Tokens
         padded_tokens_a = ['[CLS]'] + tokens_a + ['[SEP]']
-        assert len(padded_tokens_a) <= max_a_len + 2
-        if max_a_len + 2 > len(padded_tokens_a):
-            padded_tokens_a += ['[PAD]'] * \
-                (max_a_len + 2 - len(padded_tokens_a))
-        assert len(padded_tokens_a) == max_a_len + 2
-        max_len_in_batch = min(self.max_tgt_length +
-                               max_a_len + 2, self.max_len)
+        assert len(padded_tokens_a) == 102
+        max_len_in_batch = min(self.max_tgt_length+self.len_vis_input+2, self.max_len) #min(100+128+2,512)
         tokens = padded_tokens_a
         if self.new_segment_ids:
             segment_ids = NEW_SEGMENT_IDS['s2s_img']*(len(padded_tokens_a)) \
-                + NEW_SEGMENT_IDS['s2s_'+self.lang]*(max_len_in_batch - len(padded_tokens_a))
+                + NEW_SEGMENT_IDS['s2s_'+self.lang+'_cap']*(max_len_in_batch - len(padded_tokens_a))
         else:
             segment_ids = SEGMENT_IDS['img']*(len(padded_tokens_a)) \
                 + SEGMENT_IDS[self.lang]*(max_len_in_batch - len(padded_tokens_a))
 
         position_ids = []
         for i in range(len(tokens_a) + 2):
-            position_ids.append(i)
-        for i in range(len(tokens_a) + 2, max_a_len + 2):
-            position_ids.append(0)
-        for i in range(max_a_len + 2, max_len_in_batch):
-            position_ids.append(i - (max_a_len + 2) + len(tokens_a) + 2)
+            position_ids.append(i) #0,1,2,3,4,...
+        for i in range(len(tokens_a) + 2, max_len_in_batch):
+            position_ids.append(i) #0,1,2,3,... start from zero
 
         # Token Indexing
         input_ids = self.indexer(tokens)
@@ -694,7 +705,7 @@ class Preprocess4Seq2seqDecoder(Pipeline):  #to-do self.lang/ new_segment_id/ tx
                 # read data from h5 files
                 with h5py.File(self.region_det_file_prefix+'_feat'+img_id[-1:] +'.h5', 'r') as region_feat_f, \
                         h5py.File(self.region_det_file_prefix+'_cls'+img_id[-1:] +'.h5', 'r') as region_cls_f, \
-                        h5py.File(self.region_bbox_file, 'r') as region_bbox_f:
+                        h5py.File(self.region_bbox_file+img_id[-1:]+'.h5', 'r') as region_bbox_f:
                     img = torch.from_numpy(region_feat_f[img_id][:]).float()
                     cls_label = torch.from_numpy(region_cls_f[img_id][:]).float()
                     vis_pe = torch.from_numpy(region_bbox_f[img_id][:])
@@ -718,7 +729,7 @@ class Preprocess4Seq2seqDecoder(Pipeline):  #to-do self.lang/ new_segment_id/ tx
             vis_pe = torch.cat((F.layer_norm(vis_pe, [6]), \
                 F.layer_norm(cls_label, [1601])), dim=-1) # 1601 hard coded...
 
-        return (input_ids, segment_ids, position_ids, input_mask, self.task_idx, img, vis_pe)
+        return (self.corpus, self.mode, img_id), (input_ids, segment_ids, position_ids, input_mask, self.task_idx, img, vis_pe)
 
 class CombinedDataset(torch.utils.data.Dataset):
     def __init__(self, datasets_dict):

@@ -4,7 +4,7 @@
 import os
 import json
 
-def language_eval(dataset, preds, model_id, split):
+def language_eval(dataset, preds, model_id, split, scores_needed):
     import sys
     sys.path.append("coco-caption")
     if dataset == 'coco':
@@ -35,7 +35,7 @@ def language_eval(dataset, preds, model_id, split):
     cocoRes = coco.loadRes(cache_path)
     cocoEval = COCOEvalCap(coco, cocoRes, 'corpus')
     cocoEval.params['image_id'] = cocoRes.getImgIds()
-    cocoEval.evaluate()
+    cocoEval.evaluate(scores_needed)
 
     # create output dictionary
     out = {}

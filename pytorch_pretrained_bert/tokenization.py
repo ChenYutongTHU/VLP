@@ -55,6 +55,8 @@ VOCAB_NAME = 'vocab.txt'
 class Indexer:
     def __init__(self, vocab_files):
         self.vocab = load_vocab(vocab_files)
+        self.ids_to_tokens = {self.vocab[token]: token for token in self.vocab}
+
     def __call__(self, tokens):
         """Converts a sequence of tokens into ids using the vocab."""
         if type(tokens)==str:
@@ -68,6 +70,14 @@ class Indexer:
             else:
                 ids.append(self.vocab[token])
         return ids
+
+    def convert_ids_to_tokens(self, ids):
+        """Converts a sequence of ids in wordpiece tokens using the vocab."""
+        tokens = []
+        for i in ids:
+            tokens.append(self.ids_to_tokens[i])
+        return tokens
+
     def __len__(self):
         return len(self.vocab)
 

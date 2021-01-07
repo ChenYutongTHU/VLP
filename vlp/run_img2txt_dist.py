@@ -34,6 +34,17 @@ from vlp.scst_utils import *
 from vlp.lang_utils import language_eval
 from misc.data_parallel import DataParallelImbalance
 
+def _get_max_step_model(output_dir):
+    fn_model_list = glob.glob(os.path.join(output_dir, "model.*.bin"))
+    fn_optim_list = glob.glob(os.path.join(output_dir, "optim.*.bin"))
+    if not fn_model_list:
+        return None
+    both_set = set([int(Path(fn).stem.split('.')[-1]) for fn in fn_model_list]) 
+    if both_set:
+        return max(both_set)
+    else:
+        return None
+
 
 def _get_max_epoch_model(output_dir):
     fn_model_list = glob.glob(os.path.join(output_dir, "model.*.bin"))
@@ -232,11 +243,17 @@ def main():
         args.region_bbox_file = os.path.join(args.image_root, args.region_bbox_file)
         #args.region_det_file_prefix = os.path.join(args.image_root, args.region_det_file_prefix) if args.dataset in ('cc', 'coco') and args.region_det_file_prefix != '' else ''
         args.region_det_file_prefix = os.path.join(args.image_root, args.region_det_file_prefix)  # not support flickr30k now
+    
+    recover_step = _get_max_step_model(args.output_dir)
     # output config
     if args.local_rank in [-1,0]:
         os.makedirs(args.output_dir, exist_ok=True)
-        json.dump(args.__dict__, open(os.path.join(
-            args.output_dir, 'opt.json'), 'w'), sort_keys=True, indent=2)
+        if recover_step:
+            json.dump(args.__dict__, open(os.path.join(
+                args.output_dir, 'opt_recover_from_{}.json'.format(recover_step)), 'w'), sort_keys=True, indent=2)
+        else:
+            json.dump(args.__dict__, open(os.path.join(
+                args.output_dir, 'opt.json'), 'w'), sort_keys=True, indent=2)
 
     logging.basicConfig(
         filename=os.path.join(args.output_dir, 'rank{}_'.format(args.local_rank)+args.log_file),
@@ -306,7 +323,7 @@ def main():
     if args.do_train:
 
         for corpus in args.dataset:
-            print('\nCorpus {}'.format(corpus))
+            logger.info('\nCorpus {}'.format(corpus))
             if corpus in ['coco', 'aic']:
                 tokenizer = tokenizers['en'] if corpus=='coco' else tokenizers['zh']
                 bi_uni_pipeline = [seq2seq_loader.Preprocess4Seq2seq(
@@ -485,7 +502,6 @@ def main():
         # logger.info("enable fp16 with amp")
 
     # Prepare model
-    recover_step = _get_max_epoch_model(args.output_dir)
     cls_num_labels = 2
     #type_vocab_size = 6 if args.new_segment_ids else 2
     type_vocab_size = 12 if args.new_segment_ids else 2
@@ -517,8 +533,9 @@ def main():
             model_recover = torch.load(os.path.join(
                 args.output_dir, "model.{0}.bin".format(recover_step)))
             # recover_step == number of epochs
-            global_step = math.floor(
-                recover_step * t_total * 1. / args.num_train_epochs)
+            # global_step = math.floor(
+            #     recover_step * t_total * 1. / args.num_train_epochs)
+            global_step = recover_step
         elif args.model_recover_path:
             logger.info("***** Recover model: %s *****",
                         args.model_recover_path)
@@ -618,11 +635,14 @@ def main():
 
     if recover_step:
         logger.info("***** Recover optimizer: %d *****", recover_step)
-        optim_recover = torch.load(os.path.join(
-            args.output_dir, "optim.{0}.bin".format(recover_step)))
-        if hasattr(optim_recover, 'state_dict'):
-            optim_recover = optim_recover.state_dict()
-        optimizer.load_state_dict(optim_recover)
+        optim_file = os.path.join(args.output_dir, "optim.{0}.bin".format(recover_step))
+        if os.path.exists(optim_file):
+            optim_recover = torch.load(optim_file)
+            if hasattr(optim_recover, 'state_dict'):
+                optim_recover = optim_recover.state_dict()
+            optimizer.load_state_dict(optim_recover)
+        else:
+            logger.info("{} does not exists. Fail to recover optim".format(optim_file))
         # if args.loss_scale == 0:
         #     logger.info("***** Recover optimizer: dynamic_loss_scale *****")
         #     optimizer.dynamic_loss_scale = True
@@ -638,23 +658,33 @@ def main():
 
         model.train()
         if recover_step:
-            start_epoch = recover_step+1
+            step_per_epoch = len(train_dataloader)/args.gradient_accumulation_steps
+            start_epoch = math.ceil(recover_step/step_per_epoch)
         else:
             start_epoch = 1
         for i_epoch in trange(start_epoch, args.num_train_epochs+1, desc="Epoch"):
             if args.local_rank >= 0:
                 train_batch_sampler.set_epoch(i_epoch-1)
-            iter_bar = tqdm(train_dataloader, desc='Iter (loss=X.XXX)')
+            if args.local_rank in [-1,0]:
+                iter_bar = tqdm(train_dataloader, desc='Iter (loss=X.XXX)')
+            else:
+                iter_bar = train_dataloader
             nbatches = len(train_dataloader)
             train_loss = []
             pretext_loss = []
             vqa2_loss = []
             scst_reward = []
             is_first=True
+            corpus_count = {}
             for step, iter_output in enumerate(iter_bar):
                 info_, batch = iter_output[0], iter_output[1]   
                 batch = [t.to(device) for t in batch]
 
+                curr_corpus = info_[0][0]
+                if curr_corpus not in corpus_count:
+                    corpus_count[curr_corpus] = 1
+                else:
+                    corpus_count[curr_corpus] += 1
                 if info_[0][0] in ['coco','aic']:
                     input_ids, segment_ids, input_mask, lm_label_ids, masked_pos, masked_weights, is_next, task_idx, img, vis_masked_pos, vis_pe, ans_labels = batch
                     if args.enable_butd:
@@ -732,13 +762,14 @@ def main():
                 loss = masked_lm_loss #+ pretext_loss_deprecated + ans_loss
 
                 # logging for each step (i.e., before normalization by args.gradient_accumulation_steps)
-                iter_bar.set_description('Iter (loss=%5.3f)' % loss.item())
+
+                #iter_bar.set_description('Iter (loss=%5.3f)' % loss.item())
                 train_loss.append(loss.item())
                 pretext_loss.append(pretext_loss_deprecated.item())
                 vqa2_loss.append(ans_loss.item())
                 scst_reward.append(mean_reward.item())
-                if step%100 == 0:
-                    logger.info("Epoch {}, Iter {}, Loss {:.2f}, Pretext {:.2f}, VQA2 {:.2f}, Mean R {:.3f}\n".format(i_epoch, step, np.mean(train_loss), np.mean(pretext_loss), np.mean(vqa2_loss), np.mean(scst_reward)))
+                # if step%100 == 0:
+                #     logger.info("Epoch {}, Iter {}, Loss {:.2f}, Pretext {:.2f}, VQA2 {:.2f}, Mean R {:.3f}\n".format(i_epoch, step, np.mean(train_loss), np.mean(pretext_loss), np.mean(vqa2_loss), np.mean(scst_reward)))
 
                 if args.enable_visdom:
                     if vis_window['iter'] is None:
@@ -802,10 +833,10 @@ def main():
                             args.output_dir, "optim.{0}.bin".format(global_step))
                         if args.local_rank in (-1, 0): # save model if the first device or no dist
                             torch.save(copy.deepcopy(model_to_save).cpu().state_dict(), output_model_file)
-                            # torch.save(optimizer.state_dict(), output_optim_file) # disable for now, need to sanitize state and ship everthing back to cpu
+                            torch.save(optimizer.state_dict(), output_optim_file) # disable for now, need to sanitize state and ship everthing back to cpu
 
                         if args.local_rank in [0,-1]:
-                            print('')
+                            print('\n')
                             logger.info("** ** * Validation global steps {} ** ** * ".format(global_step))
                             for corpus in args.dataset:
                                 if 'valid_dataset' in args.dataset[corpus]:
@@ -824,11 +855,6 @@ def main():
                                         with torch.no_grad():
                                             batch = [t.to(device) for t in batch]
                                             input_ids, segment_ids, position_ids, input_mask, task_idx, img, vis_pe = batch
-                                            # print(input_ids[0])
-                                            # print(segment_ids[0])
-                                            # print(position_ids[0])
-                                            # print(input_mask[0])
-                                            # input()
                                             if args.enable_butd:
                                                 conv_feats = img.data # Bx100x2048
                                                 vis_pe = vis_pe.data
@@ -841,7 +867,10 @@ def main():
                                                 vis_pe = vis_pe.half()
 
                                             beam_size = 1
-                                            traces = model.decode(conv_feats, vis_pe, input_ids, segment_ids, position_ids, input_mask, 
+                                            traces = model.module.decode(
+                                                vis_feats=conv_feats, vis_pe=vis_pe, 
+                                                input_ids=input_ids, token_type_ids=segment_ids, 
+                                                position_ids=position_ids, input_mask=input_mask, 
                                                 search_beam_size=beam_size, task_idx=task_idx, sample_mode='greedy') #validation greedy
                                             if beam_size > 1:
                                                 traces = {k: v.tolist() for k, v in traces.items()}
@@ -856,19 +885,30 @@ def main():
                                                         break
                                                     output_tokens.append(t)
                                                 output_sequence = ' '.join(detokenize(output_tokens))
+                                                #print(output_sequence)
                                                 if corpus=='coco':
                                                     id_ = int(info_[ii][2].split('_')[2])
+                                                else:
+                                                    id_ = info_[ii][2]
                                                 output_lines[id_] = output_sequence
                                     predictions = [{'image_id': ids_, 'caption': output_lines[ids_]} for ids_ in output_lines]
                                     with open(os.path.join(args.output_dir,'{}_{}_predictions.json').format(global_step, corpus),'w') as f:
                                         json.dump(predictions, f)
-                                    print('Begin evaluating '+corpus)
+
+                                    print('\nBegin evaluating '+corpus)
                                     lang_stats = language_eval(corpus, predictions, 
                                         args.model_recover_path.split('/')[-2]+'-'+'val'+'-'+args.model_recover_path.split('/')[-1].split('.')[-2], 
                                         'val',
                                         ['Bleu','METEOR','Rouge','CIDEr'])
                                     with open(os.path.join(args.output_dir,'{}_{}_scores.json').format(global_step, corpus),'w') as f:
                                         json.dump(lang_stats, f)
+                                    for s in lang_stats:
+                                        if s in ['Bleu_4','CIDEr','METEOR','Rouge']:
+                                            logger.info('{}:{:.4}'.format(s, lang_stats[s]))
+                                    if args.enable_tensorboard:
+                                        for s in lang_stats:
+                                            if s in ['Bleu_4','CIDEr','METEOR','Rouge']:
+                                                writer.add_scalar('{}_{}'.format(s,corpus), lang_stats[s], global_step)
 
                     global_step += 1
 
@@ -878,6 +918,7 @@ def main():
 
             if args.local_rank >= 0:
                 torch.distributed.barrier()
+            logger.info("*Corpus Count:{}".format(corpus_count))
 
 
 if __name__ == "__main__":

@@ -54,6 +54,7 @@ def ascii_print(text):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', default='coco', type=str, nargs='*', help='')
+    parser.add_argument('--lang', default='en zh', type=str, nargs='*', help='')
     parser.add_argument('--max_len_en', default=25, type=int, help='maximum length of English in **bilingual** corpus')
     parser.add_argument('--max_len_zh', default=25, type=int, help='maximum length of Chinese in **bilingual** corpus')
     parser.add_argument('--max_len_en_cap', default=25, type=int, help='maximum length of English in **img2txt** corpus')
@@ -123,6 +124,7 @@ def main():
             dataset[d] = {'max_len_a': args.max_len_en, 'max_len_b': args.max_len_zh}
         dataset[d]['max_seq_length'] = dataset[d]['max_len_a'] + dataset[d]['max_len_b'] + 3
     args.dataset = dataset
+    lang2cap_max_seq_length = {'zh':args.len_vis_input+args.max_len_zh_cap+3, 'en':args.len_vis_input+args.max_len_en_cap+3}
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
@@ -154,35 +156,41 @@ def main():
         with open(args.xml_vocab,'r') as f:
             tokenizer_zh.vocab = json.load(f)
         tokenizers['zh'] = tokenizer_zh
-    indexer = Indexer([os.path.join(args.bert_model,'vocab.txt'), args.xml_vocab])
+    if 'coco_g8_lr3e-5_batch512_ft_from_s0.75_b0.25' in args.model_recover_path:
+        indexer = Indexer([os.path.join(args.bert_model,'vocab.txt')])
+    else:
+        indexer = Indexer([os.path.join(args.bert_model,'vocab.txt'), args.xml_vocab])
 
     for corpus in args.dataset:
         if corpus in ['coco','aic']:
-            tokenizer = tokenizers['en'] if corpus=='coco' else tokenizers['zh']
-            decode_pipeline= [seq2seq_loader.Preprocess4Seq2seqDecoder(
-                corpus,  
-                'zh' if corpus in ['aic'] else 'en',
-                list(tokenizer.vocab.keys()), indexer, 
-                max_len=args.dataset[corpus]['max_seq_length'],
-                max_tgt_length=args.max_tgt_length, new_segment_ids=args.new_segment_ids,
-                mode='s2s', len_vis_input=args.len_vis_input, enable_butd=args.enable_butd,
-                region_bbox_file=args.region_bbox_file.format(corpus.upper(), corpus.lower()), 
-                region_det_file_prefix=args.region_det_file_prefix.format(corpus.upper(), corpus.lower()))]
-            eval_dataset = seq2seq_loader.Img2txtDataset(
-                                    args.src_file.format(corpus.upper(), corpus.lower()),
-                                    args.image_root.format(corpus.upper()), 
-                                    args.split, args.batch_size,
-                                    tokenizer,
-                                    args.dataset[corpus]['max_seq_length'], 
-                                    preprocessed=True,
-                                    file_valid_jpgs=args.file_valid_jpgs.format(corpus.upper(), corpus.lower()),
-                                    bi_uni_pipeline=decode_pipeline, use_num_imgs=-1,
-                                    s2s_prob=1, bi_prob=0,
-                                    enable_butd=args.enable_butd, tasks='img2txt')
-            args.dataset[corpus]['eval_dataloader'] = torch.utils.data.DataLoader(
-                        eval_dataset, batch_size=args.batch_size,
-                        sampler=SequentialSampler(eval_dataset), num_workers=4, 
-                        collate_fn=batch_list_to_batch_tensors, pin_memory=True)
+            #bilingual
+            for lang in args.lang:
+                tokenizer = tokenizers[lang]#tokenizers['en'] if corpus=='coco' else tokenizers['zh']
+                max_seq_length = lang2cap_max_seq_length[lang]
+                decode_pipeline= [seq2seq_loader.Preprocess4Seq2seqDecoder(
+                    corpus,  
+                    lang,
+                    list(tokenizer.vocab.keys()), indexer, 
+                    max_len=max_seq_length,
+                    max_tgt_length=args.max_tgt_length, new_segment_ids=args.new_segment_ids,
+                    mode='s2s', len_vis_input=args.len_vis_input, enable_butd=args.enable_butd,
+                    region_bbox_file=args.region_bbox_file.format(corpus.upper(), corpus.lower()), 
+                    region_det_file_prefix=args.region_det_file_prefix.format(corpus.upper(), corpus.lower()))]
+                eval_dataset = seq2seq_loader.Img2txtDataset(
+                                        args.src_file.format(corpus.upper(), corpus.lower()),
+                                        args.image_root.format(corpus.upper()), 
+                                        args.split, args.batch_size,
+                                        tokenizer,
+                                        max_seq_length, 
+                                        preprocessed=True,
+                                        file_valid_jpgs=args.file_valid_jpgs.format(corpus.upper(), corpus.lower()),
+                                        bi_uni_pipeline=decode_pipeline, use_num_imgs=-1,
+                                        s2s_prob=1, bi_prob=0,
+                                        enable_butd=args.enable_butd, tasks='img2txt')
+                args.dataset[corpus][lang+'_eval_dataloader'] = torch.utils.data.DataLoader(
+                            eval_dataset, batch_size=args.batch_size,
+                            sampler=SequentialSampler(eval_dataset), num_workers=4, 
+                            collate_fn=batch_list_to_batch_tensors, pin_memory=True)
         else:
             raise NotImplementedError # only support aic and coco now
 
@@ -231,58 +239,64 @@ def main():
         torch.cuda.empty_cache()
         model.eval()
         for corpus in args.dataset:
-            if not 'eval_dataloader' in args.dataset[corpus]:
-                continue
-            print('corpus {}'.format(corpus))
-            output_lines = {}
-            val_iter_bar = tqdm(args.dataset[corpus]['eval_dataloader'])
-            for step_val, val_iter_output in enumerate(val_iter_bar):
-                info_, batch = val_iter_output[0],val_iter_output[1]
-                with torch.no_grad():
-                    batch = [t.to(device) for t in batch]
-                    input_ids, segment_ids, position_ids, input_mask, task_idx, img, vis_pe = batch
-                    if args.enable_butd:
-                        conv_feats = img.data # Bx100x2048
-                        vis_pe = vis_pe.data
-                    else:
-                        conv_feats, _ = cnn(img.data) # Bx2048x7x7
-                        conv_feats = conv_feats.view(conv_feats.size(0), conv_feats.size(1),
-                            -1).permute(0,2,1).contiguous()
-                    if args.amp:
-                        conv_feats = conv_feats.half()
-                        vis_pe = vis_pe.half()
-
-                    traces = model(conv_feats, vis_pe, input_ids, segment_ids, position_ids, input_mask, 
-                        search_beam_size=args.beam_size, task_idx=task_idx, sample_mode='greedy') #validation greedy
-                    if args.beam_size > 1:
-                        traces = {k: v.tolist() for k, v in traces.items()}
-                        output_ids = traces['pred_seq']
-                    else:
-                        output_ids = traces[0].tolist()
-                    for ii,w_ids in enumerate(output_ids):
-                        output_buf = indexer.convert_ids_to_tokens(w_ids)
-                        output_tokens = []
-                        for t in output_buf:
-                            if t in ("[SEP]", "[PAD]"):
-                                break
-                            output_tokens.append(t)
-                        output_sequence = ' '.join(detokenize(output_tokens))
-                        if corpus=='coco':
-                            id_ = int(info_[ii][2].split('_')[2])
+            for lang in ['en','zh']:
+                if not lang+'_eval_dataloader' in args.dataset[corpus]:
+                    continue
+                print('corpus {} lang {}'.format(corpus, lang))
+                output_lines = {}
+                val_iter_bar = tqdm(args.dataset[corpus][lang+'_eval_dataloader'])
+                for step_val, val_iter_output in enumerate(val_iter_bar):
+                    info_, batch = val_iter_output[0],val_iter_output[1]
+                    with torch.no_grad():
+                        batch = [t.to(device) for t in batch]
+                        input_ids, segment_ids, position_ids, input_mask, task_idx, img, vis_pe = batch
+                        # if step_val==0:
+                        #     print(segment_ids[0][100:])
+                        #     input()
+                        #input()
+                        if args.enable_butd:
+                            conv_feats = img.data # Bx100x2048
+                            vis_pe = vis_pe.data
                         else:
-                            id_ = info_[ii][2]
-                        #print(id_,output_sequence)
-                        output_lines[id_] = output_sequence
-            predictions = [{'image_id': ids_, 'caption': output_lines[ids_]} for ids_ in output_lines]
-            with open(os.path.join(args.output_dir,'{}_{}_predictions.json').format(args.split, corpus),'w') as f:
-                json.dump(predictions, f)
-            print('Begin evaluating '+corpus)
-            lang_stats = language_eval(corpus, predictions, 
-                args.model_recover_path.split('/')[-2]+'-'+args.split+'-'+args.model_recover_path.split('/')[-1].split('.')[-2], 
-                args.split,
-                ['Bleu','METEOR','Rouge','CIDEr'])
-            with open(os.path.join(args.output_dir,'{}_{}_scores.json').format(args.split, corpus),'w') as f:
-                json.dump(lang_stats, f)
+                            conv_feats, _ = cnn(img.data) # Bx2048x7x7
+                            conv_feats = conv_feats.view(conv_feats.size(0), conv_feats.size(1),
+                                -1).permute(0,2,1).contiguous()
+                        if args.amp:
+                            conv_feats = conv_feats.half()
+                            vis_pe = vis_pe.half()
+
+                        traces = model(conv_feats, vis_pe, input_ids, segment_ids, position_ids, input_mask, 
+                            search_beam_size=args.beam_size, task_idx=task_idx, sample_mode='greedy') #validation greedy
+                        if args.beam_size > 1:
+                            traces = {k: v.tolist() for k, v in traces.items()}
+                            output_ids = traces['pred_seq']
+                        else:
+                            output_ids = traces[0].tolist()
+                        for ii,w_ids in enumerate(output_ids):
+                            output_buf = indexer.convert_ids_to_tokens(w_ids)
+                            output_tokens = []
+                            for t in output_buf:
+                                if t in ("[SEP]", "[PAD]"):
+                                    break
+                                output_tokens.append(t)
+                            output_sequence = ' '.join(detokenize(output_tokens))
+                            if corpus=='coco':
+                                id_ = int(info_[ii][2].split('_')[2])
+                            else:
+                                id_ = info_[ii][2]
+                            #print(id_,output_sequence)
+                            output_lines[id_] = output_sequence
+                predictions = [{'image_id': ids_, 'caption': output_lines[ids_]} for ids_ in output_lines]
+                with open(os.path.join(args.output_dir,'{}_{}_{}_predictions.json').format(args.split, corpus, lang),'w') as f:
+                    json.dump(predictions, f)
+                if (corpus=='coco' and lang=='en') or (corpus=='aic' and lang=='zh'):
+                    print('Begin evaluating '+corpus)
+                    lang_stats = language_eval(corpus, predictions, 
+                        args.model_recover_path.split('/')[-2]+'-'+args.split+'-'+args.model_recover_path.split('/')[-1].split('.')[-2], 
+                        args.split,
+                        ['Bleu','METEOR','Rouge','CIDEr'])
+                    with open(os.path.join(args.output_dir,'{}_{}_{}_scores.json').format(args.split, corpus,lang),'w') as f:
+                        json.dump(lang_stats, f)
 
 
 if __name__ == "__main__":

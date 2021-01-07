@@ -3,7 +3,7 @@
 
 import os
 import json
-
+import jieba
 def language_eval(dataset, preds, model_id, split, scores_needed):
     import sys
     sys.path.append("coco-caption")
@@ -13,6 +13,16 @@ def language_eval(dataset, preds, model_id, split, scores_needed):
         annFile = 'coco-caption/annotations/caption_flickr30k.json'
     elif dataset == 'cc':
         annFile = 'coco-caption/annotations/caption_cc_val.json'
+    elif dataset== 'aic':
+        annFile = 'coco-caption/annotations/caption_aic_val_2.json'
+        #post-process zh
+        for item in preds:
+            #print(preds[id_])
+            item['caption'] = item['caption'].replace('</w>','').replace('。','').replace(' ','') #remove </w> 。 blank
+        #re-cut
+            item['caption'] = ' '.join(list(jieba.cut(item['caption'], cut_all=False)))
+            #print(preds[id_])
+            #input()
 
     from pycocotools.coco import COCO
     from pycocoevalcap.eval import COCOEvalCap

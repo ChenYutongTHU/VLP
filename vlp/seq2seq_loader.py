@@ -293,8 +293,8 @@ class Preprocess4Seq2seqBilingual(Pipeline):
         self.new_segment_ids = new_segment_ids
         self.always_truncate_tail = truncate_config.get(
             'always_truncate_tail', False)   
-        self.max_len_a = truncate_config.get('max_len_a', None)  #
-        self.max_len_b = truncate_config.get('max_len_b', None)
+        self.max_len_en = truncate_config.get('max_len_a', None)  #
+        self.max_len_zh = truncate_config.get('max_len_b', None)
         self.max_len = max_len
         self.trunc_seg = None  # truncate the longer segment   
         self.preprocessed = preprocessed
@@ -316,14 +316,20 @@ class Preprocess4Seq2seqBilingual(Pipeline):
                 self.file_src_zh = os.path.join(os.path.dirname(self.file_src),'corpus_zh_preprocessed.hdf5')
                 with h5py.File(self.file_src_en,'r')  as en_f, \
                     h5py.File(self.file_src_zh,'r') as zh_f:
-                    tokens_a = list(en_f[self.split][idx])
-                    tokens_b = list(zh_f[self.split][idx])
+                    tokens_en = list(en_f[self.split][idx])
+                    tokens_zh = list(zh_f[self.split][idx])
         else:
             raise
 
+        if rand()<0.5: #mask En a:
+            order = 'en_first'
+            tokens_a, tokens_b = tokens_en, tokens_zh
+            self.max_len_a, self.max_len_b = self.max_len_en, self.max_len_zh
+        else: # mask en b
+            order = 'zh_first'
+            tokens_a, tokens_b = tokens_zh, tokens_en
+            self.max_len_a, self.max_len_b = self.max_len_zh, self.max_len_en
 
-        #tokens_a, tokens_b = instance[:2] #[CLS] [SEP] [SEP] unincluded #en zh
-        #print(tokens_a, tokens_b)
         truncate_tokens_pair(tokens_a, tokens_b,
             self.max_len_a+self.max_len_b, max_len_a=self.max_len_a, max_len_b=self.max_len_b,
             trunc_seg=self.trunc_seg, always_truncate_tail=self.always_truncate_tail)
@@ -334,24 +340,25 @@ class Preprocess4Seq2seqBilingual(Pipeline):
 
         if self.new_segment_ids:
             if self.mode == 's2s':
-                segment_ids = NEW_SEGMENT_IDS['s2s_en'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['s2s_zh'] * (len(tokens_b)+1)
+                if order=='en_first':
+                    segment_ids = NEW_SEGMENT_IDS['s2s_en'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['s2s_zh'] * (len(tokens_b)+1)
+                else:
+                    segment_ids = NEW_SEGMENT_IDS['s2s_zh'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['s2s_en'] * (len(tokens_b)+1)
             elif self.mode == 'bi':
-                segment_ids = NEW_SEGMENT_IDS['bi_en'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['bi_zh'] * (len(tokens_b)+1)
+                if order=='en_first':
+                    segment_ids = NEW_SEGMENT_IDS['bi_en'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['bi_zh'] * (len(tokens_b)+1)
+                else:
+                    segment_ids = NEW_SEGMENT_IDS['bi_zh'] * (len(tokens_a)+2) + NEW_SEGMENT_IDS['bi_en'] * (len(tokens_b)+1)
         else:
-            segment_ids = SEGMENT_IDS['en'] * (len(tokens_a)+2) + SEGMENT_IDS['zh'] * (len(tokens_b)+1)
-
-
+            if order=='en_first':
+                segment_ids = SEGMENT_IDS['en'] * (len(tokens_a)+2) + SEGMENT_IDS['zh'] * (len(tokens_b)+1)
+            else:
+                segment_ids = SEGMENT_IDS['zh'] * (len(tokens_a)+2) + SEGMENT_IDS['en'] * (len(tokens_b)+1)
 
 
         # candidate positions of masked tokens
         cand_pos = []
         special_pos = set()
-
-        if rand()<0.5: #mask En a:
-            mask_type = 'a'
-        else: # mask en b
-            mask_type = 'b'
-
 
         for i, tk in enumerate(tokens):
             #for bilingual dataset, we can mask tokens of both langs
@@ -359,17 +366,12 @@ class Preprocess4Seq2seqBilingual(Pipeline):
                 special_pos.add(i)
             elif self.preprocessed and tk in self.indexer(['[CLS]','[SEP]']):
                 special_pos.add(i)
-            else:
-                if mask_type=='a' and i<1+len(tokens_a):
-                    cand_pos.append(i)
-                elif mask_type=='b' and i>=2+len(tokens_a):
-                    cand_pos.append(i)
+            if i>=2+len(tokens_a):
+                cand_pos.append(i)
         shuffle(cand_pos)
         n_pred = min(self.max_pred, max(
             1, int(round(len(cand_pos) * self.mask_prob))))
 
-        # if n_pred==3:
-        #     assert len(cand_pos)>=3, cand_pos
         masked_pos = cand_pos[:n_pred]
         masked_tokens = [tokens[pos] for pos in masked_pos]
         for pos in masked_pos:
@@ -378,10 +380,10 @@ class Preprocess4Seq2seqBilingual(Pipeline):
                 if self.preprocessed:
                     tokens[pos] = self.indexer(tokens[pos])
             elif rand() < 0.5:  # 10%
-                if mask_type=='a':
-                    tokens[pos] = get_random_word(list(self.tokenizers['en'].vocab.keys()))
-                else:
+                if order=='en_first':
                     tokens[pos] = get_random_word(list(self.tokenizers['zh'].vocab.keys()))
+                else: #zh_first predict en
+                    tokens[pos] = get_random_word(list(self.tokenizers['en'].vocab.keys()))
                 if self.preprocessed:
                     tokens[pos] = self.indexer(tokens[pos])
 
@@ -403,16 +405,10 @@ class Preprocess4Seq2seqBilingual(Pipeline):
 
         #attention mask
         input_mask = torch.zeros(self.max_len, self.max_len, dtype=torch.long)
-        if mask_type=='a':
-            second_st, second_end = 0, len(tokens_a)+2
-        else:
-            second_st, second_end = len(tokens_a)+2, len(tokens_a)+len(tokens_b)+3
+        second_st, second_end = len(tokens_a)+2, len(tokens_a)+len(tokens_b)+3
 
         if self.mode == "s2s": #to-check
-            if mask_type=='a':
-                input_mask[:, len(tokens_a)+2:len(tokens_a)+len(tokens_b)+3].fill_(1) #all attend to zh
-            else:
-                input_mask[:, :len(tokens_a)+2].fill_(1) #all attend to en 
+            input_mask[:, :len(tokens_a)+2].fill_(1) #all attend to en 
             input_mask[second_st:second_end, second_st:second_end].copy_(
                 self._tril_matrix[:second_end-second_st, :second_end-second_st])
         else:
@@ -427,7 +423,7 @@ class Preprocess4Seq2seqBilingual(Pipeline):
             masked_weights.extend([0] * n_pad)
         assert len(masked_ids)==3 and len(masked_pos)==3 and len(masked_weights)==3, [len(masked_ids),len(masked_pos),len(masked_weights),self.max_pred, n_pred]
 
-        return (self.corpus,self.mode), (input_ids, segment_ids, input_mask, masked_ids, masked_pos, masked_weights, -1, self.task_idx)#, img, vis_masked_pos, vis_pe, ans_tk)
+        return (self.corpus,self.mode, order), (input_ids, segment_ids, input_mask, masked_ids, masked_pos, masked_weights, -1, self.task_idx)#, img, vis_masked_pos, vis_pe, ans_tk)
 
 class Preprocess4Seq2seq(Pipeline):
     """ Pre-processing steps for pretraining transformer """

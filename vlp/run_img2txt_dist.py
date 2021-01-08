@@ -504,7 +504,7 @@ def main():
     # Prepare model
     cls_num_labels = 2
     #type_vocab_size = 6 if args.new_segment_ids else 2
-    type_vocab_size = 12 if args.new_segment_ids else 2
+    type_vocab_size = 12 if args.new_segment_ids else 12
     relax_projection = 4 if args.relax_projection else 0
     task_idx_proj = 3 if args.tasks == 'img2txt' else 0
     mask_word_id, eos_word_ids, pad_word_ids = indexer(["[MASK]", "[SEP]", "[PAD]"]) # index in BERT vocab: 103, 102, 0

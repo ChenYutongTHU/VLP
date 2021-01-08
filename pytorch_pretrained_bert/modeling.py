@@ -1040,7 +1040,7 @@ class BertPreTrainingPairRel(nn.Module):
         return F.logsigmoid(pair_score * pair_pos_neg_mask.type_as(pair_score)).mul_(-1.0)
 
 
-def beam_search(self_model, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, attention_mask, search_beam_size=1, task_idx=None):
+def beam_search(self_model, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, attention_mask, search_beam_size=1, mode='img2txt', task_idx=None):
     length_penalty = self_model.length_penalty
     eos_id = self_model.eos_id
     forbid_duplicate_ngrams = self_model.forbid_duplicate_ngrams
@@ -1080,7 +1080,7 @@ def beam_search(self_model, vis_feats, vis_pe, input_ids, token_type_ids, positi
                                              start_pos:next_pos + 1, :next_pos + 1]
         curr_position_ids = position_ids[:, start_pos:next_pos + 1]
         new_encoded_layers, _, new_embedding = \
-            self_model.bert('img2txt',
+            self_model.bert(mode=mode,
             vis_feats=vis_feats, vis_pe=vis_pe,  
             input_ids=x_input_ids, token_type_ids=curr_token_type_ids, 
             position_ids=curr_position_ids,
@@ -1290,12 +1290,13 @@ def beam_search(self_model, vis_feats, vis_pe, input_ids, token_type_ids, positi
 
     return traces
 
-def decode(self_model, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, attention_mask, search_beam_size=1, task_idx=None, sample_mode='greedy'):
-    vis_feats = self_model.vis_embed(vis_feats) # image region features
-    vis_pe = self_model.vis_pe_embed(vis_pe) # image region positional encodings
+def decode(self_model, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, attention_mask, search_beam_size=1, mode='img2txt', task_idx=None, sample_mode='greedy'):
+    if mode=='img2txt':
+        vis_feats = self_model.vis_embed(vis_feats) # image region features
+        vis_pe = self_model.vis_pe_embed(vis_pe) # image region positional encodings
 
     if search_beam_size > 1:
-        return beam_search(self_model, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, attention_mask, search_beam_size, task_idx)
+        return beam_search(self_model, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, attention_mask, search_beam_size, mode, task_idx)
     input_shape = list(input_ids.size())
     batch_size = input_shape[0]
     input_length = input_shape[1]
@@ -1327,7 +1328,7 @@ def decode(self_model, vis_feats, vis_pe, input_ids, token_type_ids, position_id
         # print(start_pos, next_pos+1)
         # print(curr_position_ids[0])
         new_encoded_layers, _, new_embedding = \
-            self_model.bert('img2txt', 
+            self_model.bert(mode, 
             vis_feats=vis_feats, vis_pe=vis_pe, 
             input_ids=x_input_ids, token_type_ids=curr_token_type_ids, 
             position_ids=curr_position_ids,
@@ -1598,8 +1599,8 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
                                        nn.Dropout(config.hidden_dropout_prob))
 
 
-    def forward(self, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, attention_mask, search_beam_size=1, task_idx=None, sample_mode='greedy'):
-        return decode(self, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, attention_mask, search_beam_size=search_beam_size, task_idx=task_idx, sample_mode=sample_mode)
+    def forward(self, vis_feats=None, vis_pe=None, input_ids=None, token_type_ids=None, position_ids=None, attention_mask=None, search_beam_size=1, task_idx=None, mode='img2txt', sample_mode='greedy'):
+        return decode(self, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, attention_mask, search_beam_size=search_beam_size, mode=mode, task_idx=task_idx, sample_mode=sample_mode)
 
 
 

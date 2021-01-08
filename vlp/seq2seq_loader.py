@@ -119,7 +119,10 @@ class Txt2txtDataset(torch.utils.data.Dataset): #to-do
         return self.N_lines
 
     def __getitem__(self, idx):
-        proc = choices(self.bi_uni_pipeline, weights=[self.s2s_prob, self.bi_prob])[0]
+        if len(self.bi_uni_pipeline)==2:
+            proc = choices(self.bi_uni_pipeline, weights=[self.s2s_prob, self.bi_prob])[0]
+        else:
+            proc = self.bi_uni_pipeline[0]
         instance = proc(idx)
         return instance
     def __iter__(self):  # iterator to load data
@@ -306,14 +309,17 @@ class Preprocess4Seq2seqBilingual(Pipeline):
             self.task_idx = 0
 
     def __call__(self, idx):
-        assert self.preprocessed, 'Only support preprocessed h5py now'
-        if self.preprocessed:
-            self.file_src_en = os.path.join(os.path.dirname(self.file_src),'corpus_en_preprocessed.hdf5')
-            self.file_src_zh = os.path.join(os.path.dirname(self.file_src),'corpus_zh_preprocessed.hdf5')
-            with h5py.File(self.file_src_en,'r')  as en_f, \
-                h5py.File(self.file_src_zh,'r') as zh_f:
-                tokens_a = list(en_f[self.split][idx])
-                tokens_b = list(zh_f[self.split][idx])
+        if self.corpus=='wmt':
+            assert self.preprocessed, 'Only support preprocessed h5py for wmt now'
+            if self.preprocessed:
+                self.file_src_en = os.path.join(os.path.dirname(self.file_src),'corpus_en_preprocessed.hdf5')
+                self.file_src_zh = os.path.join(os.path.dirname(self.file_src),'corpus_zh_preprocessed.hdf5')
+                with h5py.File(self.file_src_en,'r')  as en_f, \
+                    h5py.File(self.file_src_zh,'r') as zh_f:
+                    tokens_a = list(en_f[self.split][idx])
+                    tokens_b = list(zh_f[self.split][idx])
+        else:
+            raise
 
 
         #tokens_a, tokens_b = instance[:2] #[CLS] [SEP] [SEP] unincluded #en zh
@@ -348,7 +354,7 @@ class Preprocess4Seq2seqBilingual(Pipeline):
 
 
         for i, tk in enumerate(tokens):
-            #for bilingual dataset, we can mask both tokens
+            #for bilingual dataset, we can mask tokens of both langs
             if not self.preprocessed and tk in ['[CLS]', '[SEP]']:
                 special_pos.add(i)
             elif self.preprocessed and tk in self.indexer(['[CLS]','[SEP]']):
@@ -622,6 +628,64 @@ class Preprocess4Seq2seq(Pipeline):
                 ans_tk = img.new(1)
 
         return (self.corpus, self.mode),(input_ids, segment_ids, input_mask, masked_ids, masked_pos, masked_weights, -1, self.task_idx, img, vis_masked_pos, vis_pe, ans_tk)
+
+
+class Preprocess4Seq2SeqBilingualDecoder(Pipeline):
+    def __init__(self, corpus, file_src, src_lang, indexer, tokenizers, max_len, max_tgt_length, new_segment_ids, preprocessed, mode='s2s'):
+        super().__init__()
+        assert corpus in ['txt']
+        self.corpus = corpus
+        self.file_src = file_src
+        self.src_lang = src_lang
+        assert self.src_lang=='en', 'only support src_lang=en'
+        self.indexer = indexer
+        self.tokenizers = tokenizers
+        self.max_len = max_len
+        self._tril_matrix = torch.tril(torch.ones(
+            (max_len, max_len), dtype=torch.long))
+
+        self.max_tgt_length = max_tgt_length
+        self.new_segment_ids = new_segment_ids
+        self.mode = mode
+        self.preprocessed = preprocessed
+        self.task_idx = 3
+
+
+    def __call__(self, idx):
+        if self.corpus=='txt':
+            assert self.preprocessed==False
+            line = self.file_src[idx]
+            #print(line)
+            tokens_a = self.tokenizers[self.src_lang].tokenize(line)
+            #print(tokens_a)
+            tokens = ['[CLS]']+tokens_a+['[SEP]']
+            max_len_in_batch = min(self.max_len, self.max_tgt_length+len(tokens))
+            if self.new_segment_ids:
+                segment_ids = NEW_SEGMENT_IDS['s2s_en']*len(tokens) + NEW_SEGMENT_IDS['s2s_zh']*(max_len_in_batch-len(tokens))
+                #segment_ids = NEW_SEGMENT_IDS['s2s_en_cap']*len(tokens) + NEW_SEGMENT_IDS['s2s_zh_cap']*(max_len_in_batch-len(tokens))
+                #segment_ids = NEW_SEGMENT_IDS['bi_en']*len(tokens) + NEW_SEGMENT_IDS['bi_zh']*(max_len_in_batch-len(tokens))
+                #segment_ids = NEW_SEGMENT_IDS['s2s_zh']*len(tokens) + NEW_SEGMENT_IDS['s2s_en']*(max_len_in_batch-len(tokens))
+            else:
+                segment_ids = SEGMENT_IDS['en']*len(tokens) + SEGMENT_IDS['zh']*(max_len_in_batch-len(tokens))
+            position_ids = []
+
+            for i in range(len(tokens_a) + 2):
+                position_ids.append(i) #0,1,2,3,4,...
+            for i in range(len(tokens_a) + 2, max_len_in_batch):
+                position_ids.append(i) #0,1,2,3,... start from zero
+
+            input_ids = self.indexer(tokens)
+
+            # Zero Padding
+            input_mask = torch.zeros(
+                max_len_in_batch, max_len_in_batch, dtype=torch.long)
+            input_mask[:, :len(tokens_a)+2].fill_(1)
+            second_st, second_end = len(tokens), max_len_in_batch
+
+            input_mask[second_st:second_end, second_st:second_end].copy_(
+                self._tril_matrix[:second_end-second_st, :second_end-second_st])
+
+            return (self.corpus, self.mode),(input_ids, segment_ids, position_ids, input_mask, self.task_idx)
 
 
 class Preprocess4Seq2seqDecoder(Pipeline):  #to-do self.lang/ new_segment_id/ txt

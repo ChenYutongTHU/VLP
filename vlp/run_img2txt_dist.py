@@ -483,7 +483,7 @@ def main():
 
         train_dataloader = torch.utils.data.DataLoader(train_dataset,
             batch_sampler=train_batch_sampler, num_workers=args.num_workers,
-            collate_fn=batch_list_to_batch_tensors, pin_memory=True)
+            collate_fn=batch_list_to_batch_tensors, pin_memory=False)
 
 
 
@@ -845,7 +845,7 @@ def main():
                                     val_dataloader = torch.utils.data.DataLoader(
                                                 val_dataset, batch_size=args.train_batch_size,
                                                 sampler=SequentialSampler(val_dataset), num_workers=args.num_workers, 
-                                                collate_fn=batch_list_to_batch_tensors, pin_memory=True)
+                                                collate_fn=batch_list_to_batch_tensors, pin_memory=False)
                                     logger.info("corpus {}".format(corpus))
                                     model.eval()
                                     output_lines = {}

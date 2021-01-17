@@ -643,6 +643,7 @@ def main():
             optimizer.load_state_dict(optim_recover)
         else:
             logger.info("{} does not exists. Fail to recover optim".format(optim_file))
+ #disable
         # if args.loss_scale == 0:
         #     logger.info("***** Recover optimizer: dynamic_loss_scale *****")
         #     optimizer.dynamic_loss_scale = True
@@ -833,7 +834,7 @@ def main():
                             args.output_dir, "optim.{0}.bin".format(global_step))
                         if args.local_rank in (-1, 0): # save model if the first device or no dist
                             torch.save(copy.deepcopy(model_to_save).cpu().state_dict(), output_model_file)
-                            torch.save(optimizer.state_dict(), output_optim_file) # disable for now, need to sanitize state and ship everthing back to cpu
+                            #torch.save(optimizer.state_dict(), output_optim_file) # disable for now, need to sanitize state and ship everthing back to cpu
 
                         if args.local_rank in [0,-1]:
                             print('\n')

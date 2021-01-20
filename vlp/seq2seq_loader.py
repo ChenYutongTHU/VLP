@@ -421,7 +421,7 @@ class Preprocess4Seq2seqBilingual(Pipeline):
             masked_ids.extend([0] * n_pad)
             masked_pos.extend([0] * n_pad)
             masked_weights.extend([0] * n_pad)
-        assert len(masked_ids)==3 and len(masked_pos)==3 and len(masked_weights)==3, [len(masked_ids),len(masked_pos),len(masked_weights),self.max_pred, n_pred]
+        #assert len(masked_ids)==3 and len(masked_pos)==3 and len(masked_weights)==3, [len(masked_ids),len(masked_pos),len(masked_weights),self.max_pred, n_pred]
 
         return (self.corpus,self.mode, order), (input_ids, segment_ids, input_mask, masked_ids, masked_pos, masked_weights, -1, self.task_idx)#, img, vis_masked_pos, vis_pe, ans_tk)
 
@@ -629,11 +629,14 @@ class Preprocess4Seq2seq(Pipeline):
 class Preprocess4Seq2SeqBilingualDecoder(Pipeline):
     def __init__(self, corpus, file_src, src_lang, indexer, tokenizers, max_len, max_tgt_length, new_segment_ids, preprocessed, mode='s2s'):
         super().__init__()
-        assert corpus in ['txt']
+        assert corpus in ['txt','wmt']
         self.corpus = corpus
         self.file_src = file_src
         self.src_lang = src_lang
-        assert self.src_lang=='en', 'only support src_lang=en'
+        if self.src_lang=='en':
+            self.tgt_lang = 'zh'
+        else:
+            self.tgt_lang = 'en'
         self.indexer = indexer
         self.tokenizers = tokenizers
         self.max_len = max_len
@@ -645,6 +648,7 @@ class Preprocess4Seq2SeqBilingualDecoder(Pipeline):
         self.mode = mode
         self.preprocessed = preprocessed
         self.task_idx = 3
+        self.split = 'dev'
 
 
     def __call__(self, idx):
@@ -656,32 +660,35 @@ class Preprocess4Seq2SeqBilingualDecoder(Pipeline):
             #print(tokens_a)
             tokens = ['[CLS]']+tokens_a+['[SEP]']
             max_len_in_batch = min(self.max_len, self.max_tgt_length+len(tokens))
-            if self.new_segment_ids:
-                segment_ids = NEW_SEGMENT_IDS['s2s_en']*len(tokens) + NEW_SEGMENT_IDS['s2s_zh']*(max_len_in_batch-len(tokens))
-                #segment_ids = NEW_SEGMENT_IDS['s2s_en_cap']*len(tokens) + NEW_SEGMENT_IDS['s2s_zh_cap']*(max_len_in_batch-len(tokens))
-                #segment_ids = NEW_SEGMENT_IDS['bi_en']*len(tokens) + NEW_SEGMENT_IDS['bi_zh']*(max_len_in_batch-len(tokens))
-                #segment_ids = NEW_SEGMENT_IDS['s2s_zh']*len(tokens) + NEW_SEGMENT_IDS['s2s_en']*(max_len_in_batch-len(tokens))
-            else:
-                segment_ids = SEGMENT_IDS['en']*len(tokens) + SEGMENT_IDS['zh']*(max_len_in_batch-len(tokens))
-            position_ids = []
-
-            for i in range(len(tokens_a) + 2):
-                position_ids.append(i) #0,1,2,3,4,...
-            for i in range(len(tokens_a) + 2, max_len_in_batch):
-                position_ids.append(i) #0,1,2,3,... start from zero
-
             input_ids = self.indexer(tokens)
+        elif self.corpus=='wmt':
+            assert self.preprocessed==True
+            with h5py.File(os.path.join(os.path.dirname(self.file_src),'{}_corpus_{}_preprocessed.hdf5'.format(self.split,self.src_lang)),'r') as f:
+                tokens_a = list(f[self.split][idx])
+            input_ids = self.indexer(['[CLS]']) + tokens_a + self.indexer(['[SEP]'])
+            max_len_in_batch = min(self.max_len, self.max_tgt_length+len(input_ids))
+            #print(input_ids)
+        else:
+            raise
+        if self.new_segment_ids:
+            segment_ids = NEW_SEGMENT_IDS['s2s_'+self.src_lang]*len(input_ids) + NEW_SEGMENT_IDS['s2s_'+self.tgt_lang]*(max_len_in_batch-len(input_ids))
+        else:
+            segment_ids = SEGMENT_IDS[self.src_lang]*len(input_ids) + SEGMENT_IDS[self.tgt_lang]*(max_len_in_batch-len(input_ids))
+        position_ids = []
+        for i in range(len(tokens_a) + 2):
+            position_ids.append(i) #0,1,2,3,4,...
+        for i in range(len(tokens_a) + 2, max_len_in_batch):
+            position_ids.append(i) #0,1,2,3,... start from zero
+        # Zero Padding
+        input_mask = torch.zeros(
+            max_len_in_batch, max_len_in_batch, dtype=torch.long)
+        input_mask[:, :len(tokens_a)+2].fill_(1)
+        second_st, second_end = len(input_ids), max_len_in_batch
 
-            # Zero Padding
-            input_mask = torch.zeros(
-                max_len_in_batch, max_len_in_batch, dtype=torch.long)
-            input_mask[:, :len(tokens_a)+2].fill_(1)
-            second_st, second_end = len(tokens), max_len_in_batch
+        input_mask[second_st:second_end, second_st:second_end].copy_(
+            self._tril_matrix[:second_end-second_st, :second_end-second_st])
 
-            input_mask[second_st:second_end, second_st:second_end].copy_(
-                self._tril_matrix[:second_end-second_st, :second_end-second_st])
-
-            return (self.corpus, self.mode),(input_ids, segment_ids, position_ids, input_mask, self.task_idx)
+        return (self.corpus, self.mode),(input_ids, segment_ids, position_ids, input_mask, self.task_idx)
 
 
 class Preprocess4Seq2seqDecoder(Pipeline):  #to-do self.lang/ new_segment_id/ txt

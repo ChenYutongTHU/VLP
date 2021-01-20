@@ -33,6 +33,7 @@ from vlp.decode_img2txt import detokenize
 from vlp.scst_utils import *
 from vlp.lang_utils import language_eval
 from misc.data_parallel import DataParallelImbalance
+from mosestokenizer import MosesDetokenizer
 
 def _get_max_step_model(output_dir):
     fn_model_list = glob.glob(os.path.join(output_dir, "model.*.bin"))
@@ -210,6 +211,7 @@ def main():
                         help='Self-critical sequence training')
     parser.add_argument('--length_penalty', type=float, default=0,
                         help="Length penalty for beam search")
+    parser.add_argument('--ngram_size', type=int, default=3)
 
     args = parser.parse_args()
     dataset = {}
@@ -437,18 +439,28 @@ def main():
                     preprocessed=True,
                     bi_uni_pipeline=bi_uni_pipeline,s2s_prob=args.s2s_prob, bi_prob=args.bi_prob)  
 
-                # if args.local_rank in [-1,0]:
-                #     decode_pipeline = [seq2seq_loader.Preprocess4Seq2seqDecoderBilingual(list(
-                #         tokenizer.vocab.keys()), tokenizer.convert_tokens_to_ids, args.max_seq_length,
-                #         max_tgt_length=args.max_tgt_length, new_segment_ids=args.new_segment_ids,
-                #         mode='s2s', len_vis_input=args.len_vis_input, enable_butd=args.enable_butd,
-                #         region_bbox_file=args.region_bbox_file, region_det_file_prefix=args.region_det_file_prefix)]
-                #     args.dataset[corpus]['valid_dataset'] = seq2seq_loader.Txt2txtDataset(
-                #         args.wmt_N_lines,
-                #         'val', args.train_batch_size,
-                #         tokenizers, args.dataset[corpus]['max_seq_length'], 
-                #         preprocessed=True,
-                #         bi_uni_pipeline=bi_uni_pipeline,s2s_prob=1, bi_prob=0) 
+                if args.local_rank in [-1,0]:
+                    #args.dataset[corpus+'_zh2en'] = {}
+                    #sargs.dataset[corpus+'_en2zh'] = {}
+                    pipeline = [seq2seq_loader.Preprocess4Seq2SeqBilingualDecoder(
+                        corpus='wmt',file_src=args.src_file.format(corpus.upper(), corpus.lower()), src_lang='zh', 
+                        indexer=indexer, tokenizers=tokenizers, 
+                        max_len=args.max_len_en+args.max_len_zh+3, max_tgt_length=args.max_len_en, 
+                        preprocessed=True, new_segment_ids=args.new_segment_ids, mode='s2s')]
+                    args.dataset[corpus]['valid_dataset_zh2en'] = seq2seq_loader.Txt2txtDataset(N_lines=1999, split='dev',
+                        batch_size=1, tokenizers=tokenizers, 
+                        max_len=args.max_len_en+args.max_len_zh+3,
+                        preprocessed=True, bi_uni_pipeline=pipeline, s2s_prob=1, bi_prob=0)
+
+                    pipeline = [seq2seq_loader.Preprocess4Seq2SeqBilingualDecoder(
+                        corpus='wmt',file_src=args.src_file.format(corpus.upper(), corpus.lower()), src_lang='en', 
+                        indexer=indexer, tokenizers=tokenizers, 
+                        max_len=args.max_len_en+args.max_len_zh+3, max_tgt_length=args.max_len_zh, 
+                        preprocessed=True, new_segment_ids=args.new_segment_ids, mode='s2s')]
+                    args.dataset[corpus]['valid_dataset_en2zh'] = seq2seq_loader.Txt2txtDataset(N_lines=1999, split='dev',
+                        batch_size=1, tokenizers=tokenizers, 
+                        max_len=args.max_len_en+args.max_len_zh+3,
+                        preprocessed=True, bi_uni_pipeline=pipeline, s2s_prob=1, bi_prob=0)
         
 
         train_dataset = seq2seq_loader.CombinedDataset(
@@ -528,7 +540,7 @@ def main():
             ngram_size=args.ngram_size, min_len=0)
         global_step = 0
     else:
-        if recover_step:
+        if not recover_step==None:
             logger.info("***** Recover model: %d *****", recover_step)
             model_recover = torch.load(os.path.join(
                 args.output_dir, "model.{0}.bin".format(recover_step)))
@@ -824,6 +836,7 @@ def main():
 
                     if global_step%args.save_steps==0:
                         # Save a trained model
+                        
                         logger.info(
                             "** ** * Saving fine-tuned model and optimizer ** ** * ")
                         model_to_save = model.module if hasattr(
@@ -834,28 +847,41 @@ def main():
                             args.output_dir, "optim.{0}.bin".format(global_step))
                         if args.local_rank in (-1, 0): # save model if the first device or no dist
                             torch.save(copy.deepcopy(model_to_save).cpu().state_dict(), output_model_file)
+                        
                             #torch.save(optimizer.state_dict(), output_optim_file) # disable for now, need to sanitize state and ship everthing back to cpu
 
-                        if args.local_rank in [0,-1]:
+                        if args.local_rank in [0,-1] and global_step:
                             print('\n')
                             logger.info("** ** * Validation global steps {} ** ** * ".format(global_step))
-                            for corpus in args.dataset:
-                                if 'valid_dataset' in args.dataset[corpus]:
-                                    print('Begin decoding '+corpus)
-                                    val_dataset = args.dataset[corpus]['valid_dataset']
-                                    val_dataloader = torch.utils.data.DataLoader(
-                                                val_dataset, batch_size=args.train_batch_size,
-                                                sampler=SequentialSampler(val_dataset), num_workers=args.num_workers, 
-                                                collate_fn=batch_list_to_batch_tensors, pin_memory=False)
-                                    logger.info("corpus {}".format(corpus))
-                                    model.eval()
-                                    output_lines = {}
-                                    val_iter_bar = tqdm(val_dataloader)
-                                    for step_val, val_iter_output in enumerate(val_iter_bar):
-                                        info_, batch = val_iter_output[0],val_iter_output[1]
-                                        with torch.no_grad():
-                                            batch = [t.to(device) for t in batch]
-                                            input_ids, segment_ids, position_ids, input_mask, task_idx, img, vis_pe = batch
+                            corpus_valset = []
+                            if 'wmt' in args.dataset:
+                                corpus_valset = [['wmt_zh2en', args.dataset['wmt']['valid_dataset_zh2en']],
+                                    ['wmt_en2zh', args.dataset['wmt']['valid_dataset_en2zh']]]
+                            if 'aic' in args.dataset:
+                                corpus_valset.append(['aic', args.dataset['aic']['valid_dataset']])
+                            if 'coco' in args.dataset:
+                                corpus_valset.append(['coco', args.dataset['coco']['valid_dataset']])
+                            for corpus, val_dataset in corpus_valset:
+                                print('Begin decoding '+corpus)
+                                batch_size = 1 if 'wmt' in corpus else args.train_batch_size
+                                val_dataloader = torch.utils.data.DataLoader(
+                                            val_dataset, batch_size=batch_size,
+                                            sampler=SequentialSampler(val_dataset), num_workers=args.num_workers, 
+                                            collate_fn=batch_list_to_batch_tensors, pin_memory=False)
+                                logger.info("corpus {}".format(corpus))
+                                model.eval()
+                                output_lines = {}
+                                predictions = []
+                                val_iter_bar = tqdm(val_dataloader)
+                                for step_val, val_iter_output in enumerate(val_iter_bar):
+                                    info_, batch = val_iter_output[0],val_iter_output[1]
+                                    with torch.no_grad():
+                                        batch = [t.to(device) for t in batch]
+                                        if 'wmt' in corpus:
+                                            input_ids, segment_ids, position_ids, input_mask, task_idx = batch
+                                            conv_feats, vis_pe = None,None
+                                        else:
+                                            input_ids, segment_ids, position_ids, input_mask, task_idx, img, vis_pe = batch   
                                             if args.enable_butd:
                                                 conv_feats = img.data # Bx100x2048
                                                 vis_pe = vis_pe.data
@@ -867,35 +893,52 @@ def main():
                                                 conv_feats = conv_feats.half()
                                                 vis_pe = vis_pe.half()
 
-                                            beam_size = 1
-                                            traces = model.module.decode(
-                                                vis_feats=conv_feats, vis_pe=vis_pe, 
-                                                input_ids=input_ids, token_type_ids=segment_ids, 
-                                                position_ids=position_ids, input_mask=input_mask, 
-                                                search_beam_size=beam_size, task_idx=task_idx, sample_mode='greedy') #validation greedy
-                                            if beam_size > 1:
-                                                traces = {k: v.tolist() for k, v in traces.items()}
-                                                output_ids = traces['pred_seq']
-                                            else:
-                                                output_ids = traces[0].tolist()
-                                            for ii,w_ids in enumerate(output_ids):
-                                                output_buf = indexer.convert_ids_to_tokens(w_ids)
-                                                output_tokens = []
-                                                for t in output_buf:
-                                                    if t in ("[SEP]", "[PAD]"):
-                                                        break
-                                                    output_tokens.append(t)
-                                                output_sequence = ' '.join(detokenize(output_tokens))
-                                                #print(output_sequence)
+                                        beam_size = 1
+                                        traces = model.module.decode(
+                                            vis_feats=conv_feats, vis_pe=vis_pe, 
+                                            input_ids=input_ids, token_type_ids=segment_ids, 
+                                            position_ids=position_ids, input_mask=input_mask, 
+                                            search_beam_size=beam_size, task_idx=task_idx, 
+                                            mode='txt2txt' if 'wmt' in corpus else 'img2txt',
+                                            sample_mode='greedy') #validation greedy
+                                        if beam_size > 1:
+                                            traces = {k: v.tolist() for k, v in traces.items()}
+                                            output_ids = traces['pred_seq']
+                                        else:
+                                            output_ids = traces[0].tolist()
+
+                                        for ii,w_ids in enumerate(output_ids):
+                                            output_buf = indexer.convert_ids_to_tokens(w_ids)
+                                            output_tokens = []
+                                            for t in output_buf:
+                                                if t in ("[SEP]", "[PAD]"):
+                                                    break
+                                                output_tokens.append(t)
+                                            output_sequence = ' '.join(detokenize(output_tokens))
+                                            #print(output_sequence)
+                                            if corpus in ['aic','coco']:
                                                 if corpus=='coco':
                                                     id_ = int(info_[ii][2].split('_')[2])
                                                 else:
                                                     id_ = info_[ii][2]
-                                                output_lines[id_] = output_sequence
-                                    predictions = [{'image_id': ids_, 'caption': output_lines[ids_]} for ids_ in output_lines]
+                                                predictions.append({'image_id':id_,'caption':output_sequence})
+                                            else:
+                                                if corpus=='wmt_zh2en':
+                                                    #output_sequence = ' '.join(detokenize(output_tokens))
+
+                                                    logging.disable(logging.ERROR)
+                                                    with MosesDetokenizer('en') as mosedetokenize:
+                                                        output_sequence = mosedetokenize(detokenize(output_tokens))
+                                                    logging.disable(logging.NOTSET)
+                                                    
+                                                    output_sequence = output_sequence.replace(' @ - @ ','-')
+                                                if corpus=='wmt_en2zh':
+                                                    output_sequence = ''.join(detokenize(output_tokens)).replace('</w>','')
+                                                predictions.append(output_sequence)
+
+                                if corpus in ['aic','coco']:
                                     with open(os.path.join(args.output_dir,'{}_{}_predictions.json').format(global_step, corpus),'w') as f:
                                         json.dump(predictions, f)
-
                                     print('\nBegin evaluating '+corpus)
                                     lang_stats = language_eval(corpus, predictions, 
                                         args.model_recover_path.split('/')[-2]+'-'+'val'+'-'+args.model_recover_path.split('/')[-1].split('.')[-2], 
@@ -910,6 +953,26 @@ def main():
                                         for s in lang_stats:
                                             if s in ['Bleu_4','CIDEr','METEOR','Rouge']:
                                                 writer.add_scalar('{}_{}'.format(s,corpus), lang_stats[s], global_step)
+                                else:
+                                    print('\nBegin evaluating '+corpus)
+                                    tgtlang = corpus[-2:]
+                                    with open(os.path.join(args.output_dir,'{}_{}_predictions.json').format(global_step, corpus),'w') as f:
+                                        for p in predictions:
+                                            f.writelines(p+'\n') 
+                                    root = '/data/private/chenyutong/dataset/wmt/devset/newstest2017_detok.'
+                                    with open(root+tgtlang,'r') as f:
+                                        reference = f.readlines()
+                                        reference = [r.strip() for r in reference]
+                                    import sacrebleu
+                                    if tgtlang=='zh':
+                                        bleu = sacrebleu.corpus_bleu(predictions, [reference[:len(predictions)]], tokenize='zh')
+                                    else:
+                                        bleu = sacrebleu.corpus_bleu(predictions, [reference[:len(predictions)]])
+                                    bleu = bleu.score
+                                    logger.info('Sacrebleu.corpus_bleu {:.4}'.format(bleu))
+                                    if args.enable_tensorboard:
+                                        writer.add_scalar('sacrebleu_{}'.format(corpus), bleu, global_step)                                    
+
 
                     global_step += 1
 

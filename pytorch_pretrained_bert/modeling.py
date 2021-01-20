@@ -226,9 +226,9 @@ class BertEmbeddings(nn.Module):
 
         position_embeddings = self.position_embeddings(position_ids)
         if vis_input: #replace <UNK> with vis_feats
-            words_embeddings = torch.cat((words_embeddings[:, :1], vis_feats,
+            words_embeddings = torch.cat((words_embeddings[:, :1], vis_feats, #B,L,D
                 words_embeddings[:, len_vis_input+1:]), dim=1)
-            assert len_vis_input == 100, 'only support region attn!'
+            #assert len_vis_input == 100, 'only support region attn!'  #comment for computing visual embedding
             position_embeddings = torch.cat((position_embeddings[:, :1], vis_pe,
                 position_embeddings[:, len_vis_input+1:]), dim=1) # hacky...
 
@@ -1554,8 +1554,8 @@ class BertForPreTrainingLossMask(PreTrainedBertModel):
         else:
             return masked_lm_loss, vis_pretext_loss, masked_lm_loss.new(1).fill_(0)
 
-    def decode(self, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, input_mask, search_beam_size=1, task_idx=None, sample_mode='greedy'):
-        return decode(self, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, input_mask, search_beam_size=search_beam_size, task_idx=task_idx, sample_mode=sample_mode)
+    def decode(self, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, input_mask, search_beam_size=1, task_idx=None, mode='img2txt', sample_mode='greedy'):
+        return decode(self, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, input_mask, search_beam_size=search_beam_size, task_idx=task_idx, mode=mode, sample_mode=sample_mode)
 """ for VLP, based on UniLM """
 class BertForSeq2SeqDecoder(PreTrainedBertModel):
     """refer to BertForPreTraining"""
@@ -1602,8 +1602,15 @@ class BertForSeq2SeqDecoder(PreTrainedBertModel):
     def forward(self, vis_feats=None, vis_pe=None, input_ids=None, token_type_ids=None, position_ids=None, attention_mask=None, search_beam_size=1, task_idx=None, mode='img2txt', sample_mode='greedy'):
         return decode(self, vis_feats, vis_pe, input_ids, token_type_ids, position_ids, attention_mask, search_beam_size=search_beam_size, mode=mode, task_idx=task_idx, sample_mode=sample_mode)
 
-
-
+    def compute_embeddings(self, vis_feats=None, vis_pe=None, input_ids=None, token_type_ids=None, position_ids=None, attention_mask=None, task_idx=None, mode='img2txt', len_vis_input=1):
+        if vis_feats !=None and vis_pe != None:
+            vis_feats = self.vis_embed(vis_feats) # image region features
+            vis_pe = self.vis_pe_embed(vis_pe) # image region positional encodings
+        sequence_output, pooled_output = self.bert(mode, vis_feats, vis_pe, input_ids, token_type_ids,
+                attention_mask, output_all_encoded_layers=True, len_vis_input=len_vis_input)
+        # print(len(sequence_output), sequence_output[0].shape)
+        # input()
+        return sequence_output
 
 class BertForExtractiveSummarization(PreTrainedBertModel):
     """refer to BertForPreTraining"""
